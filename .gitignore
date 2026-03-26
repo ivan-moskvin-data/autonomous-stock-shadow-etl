@@ -13,6 +13,7 @@ env/
 # VS Code & Antigravity
 .vscode/
 .antigravity/
+.amazonq/
 
 # Data
 *.csv
