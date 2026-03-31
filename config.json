@@ -1,0 +1,20 @@
+{
+  "site": {
+    "base_url": "https://kaliningradbereg.ru",
+    "start_path": "/katalog/",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+  },
+  "crawler": {
+    "sleep_min": 1.2,
+    "sleep_max": 3.5,
+    "max_errors": 10,
+    "timeout": 10
+  },
+  "paths": {
+    "data_dir": "data",
+    "log_dir": "logs",
+    "db_name": "stock_history.sqlite"
+  }
+}
