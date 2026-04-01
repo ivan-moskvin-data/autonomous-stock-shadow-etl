@@ -1,10 +1,7 @@
 def get_anomalies_query() -> str:
-    """
-    Возвращает общий SQL запрос для поиска аномалий.
-    """
     return """
         SELECT 
-            MAX(sku) as sku, 
+            sku, 
             item_name,
             SUM(CASE WHEN SUBSTR(report_timestamp, 1, 10) = :yesterday THEN quantity ELSE 0 END) as qty_old,
             SUM(CASE WHEN SUBSTR(report_timestamp, 1, 10) = :today THEN quantity ELSE 0 END) as qty_new,
@@ -13,7 +10,7 @@ def get_anomalies_query() -> str:
         FROM stocks
         WHERE (SUBSTR(report_timestamp, 1, 10) = :today OR SUBSTR(report_timestamp, 1, 10) = :yesterday)
           AND item_name IS NOT NULL
-        GROUP BY item_name
+        GROUP BY item_name, sku
         HAVING delta > 0
     """
 

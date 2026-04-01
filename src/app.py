@@ -69,7 +69,12 @@ def load_inventory() -> pd.DataFrame:
         df = pd.read_sql_query(query, conn, params={"latest": latest_date})
         
         if not df.empty:
-            df['_search_index'] = (df['Наименование'].fillna('') + ' ' + df['Артикул'].fillna('')).str.lower().str.replace('ё', 'е')
+            # Теперь поиск будет искать и по Названию, и по Артикулу, и по Категории
+            df['_search_index'] = (
+                df['Наименование'].fillna('') + ' ' + 
+                df['Артикул'].fillna('') + ' ' + 
+                df['Категория'].fillna('') # <--- Добавили категорию в "мозги" поиска
+            ).str.lower().str.replace('ё', 'е')
         return df
 
 @st.cache_data(ttl=60) # Кэшируем на минуту, чтобы не дергать базу постоянно
@@ -157,26 +162,54 @@ except Exception:
     open_tasks_count = 0
 
 with st.sidebar:
-    st.title("💎 Stock Shadow")
-    menu_options = ["📦 Склад", f"⚠️ Аномалии ({active_anom_count})", f"🔥 Задачи ({open_tasks_count})", f"✅ Архив ({len(st.session_state.dismissed_names)})", "❄️ Неликвиды", "📈 Оборачиваемость"]
+    st.title("💎 Autonomous Stock Shadow")
     
-    try: 
-        current_idx = [m.split(' (')[0] for m in menu_options].index(st.session_state.current_page.split(' (')[0])
-    except ValueError: 
-        current_idx = 0
-    
-    choice = st.radio("Меню", menu_options, index=current_idx)
-    st.session_state.current_page = choice.split(' (')[0]
+    # --- ФУНКЦИЯ ПЕРЕКЛЮЧЕНИЯ (ЗАЩИТА ОТ ЗАЦИКЛИВАНИЯ) ---
+    def nav_changed(menu_name):
+        if menu_name == "op" and st.session_state.get("op_nav"):
+            # Обновляем текущую страницу
+            st.session_state.current_page = st.session_state.op_nav.split(' (')[0]
+            # Явно приказываем второму меню сбросить выделение
+            if "ana_nav" in st.session_state:
+                st.session_state.ana_nav = None
+                
+        elif menu_name == "ana" and st.session_state.get("ana_nav"):
+            # Обновляем текущую страницу
+            st.session_state.current_page = st.session_state.ana_nav.split(' (')[0]
+            # Явно приказываем первому меню сбросить выделение
+            if "op_nav" in st.session_state:
+                st.session_state.op_nav = None
 
+    # --- ОПРЕДЕЛЯЕМ ТЕКУЩУЮ СТРАНИЦУ ---
+    base_page = st.session_state.current_page.split(' (')[0]
+
+    # --- ЛОГИЧЕСКОЕ РАЗДЕЛЕНИЕ МЕНЮ: ОПЕРАЦИИ ---
+    st.caption("🛠 ОПЕРАЦИИ")
+    op_options = ["📦 Склад", f"⚠️ Аномалии ({active_anom_count})", f"🔥 Задачи ({open_tasks_count})"]
+    
+    op_idx = next((i for i, opt in enumerate(op_options) if opt.startswith(base_page)), None)
+    st.radio("Рабочая область", op_options, index=op_idx, key="op_nav", on_change=nav_changed, args=("op",))
+    
+    st.write("---")
+    
+    # --- ЛОГИЧЕСКОЕ РАЗДЕЛЕНИЕ МЕНЮ: АНАЛИТИКА ---
+    st.caption("📊 АНАЛИТИКА И KPI")
+    ana_options = ["🎯 Эффективность", "❄️ Неликвиды", "📈 Оборачиваемость"]
+    
+    ana_idx = next((i for i, opt in enumerate(ana_options) if opt.startswith(base_page)), None)
+    st.radio("Инструменты анализа", ana_options, index=ana_idx, key="ana_nav", on_change=nav_changed, args=("ana",))
+
+    # --- СИСТЕМНЫЕ КНОПКИ ---
     st.write("---")
     if db_stats:
-        st.caption("📊 Статистика базы")
-        st.info(f"Начало: {db_stats['start']}\n\nДней в базе: {db_stats['days_count']}")
+        st.caption("📂 Статистика базы")
+        st.info(f"Дней в базе: {db_stats['days_count']}")
     
     if st.button("🔄 Обновить данные", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
-    if st.button("🗑️ Очистить архив", use_container_width=True):
+        
+    if st.button("🗑️ Очистить легализованные", use_container_width=True, help="Вернуть все скрытые аномалии обратно в список ⚠️"):
         st.session_state.dismissed_names = []
         st.rerun()
 
@@ -234,7 +267,7 @@ if st.session_state.current_page == "📦 Склад":
         for word in query_words: mask &= df_inv['_search_index'].str.contains(word, regex=False)
         f_df = df_inv[mask].drop(columns=['_search_index'])
         
-        if 0 < len(f_df) <= 20:
+        if 0 < len(f_df) <= 50:
             cols = st.columns([2, 4, 1, 1, 2])
             for i, h in enumerate(["Артикул", "Наименование", "Цена", "Остаток", "Анализ"]): cols[i].write(f"**{h}**")
             st.divider()
@@ -306,9 +339,10 @@ if st.session_state.current_page == "📦 Склад":
                         st.session_state.manual_anomaly_id = None
                         st.rerun()
         else:
-            st.dataframe(f_df.drop(columns=['ID']), use_container_width=True, height=500)
+            st.dataframe(f_df.drop(columns=['ID', 'Категория']), use_container_width=True, height=500, hide_index=True)
     else: 
-        st.dataframe(df_inv.drop(columns=['_search_index', 'ID']), use_container_width=True, height=500)
+        # Убираем технические поля, Категорию и скрываем индекс
+        st.dataframe(df_inv.drop(columns=['_search_index', 'ID', 'Категория']), use_container_width=True, height=500, hide_index=True)
 
 # 2. СТРАНИЦА АНОМАЛИЙ
 elif st.session_state.current_page == "⚠️ Аномалии":
@@ -329,36 +363,42 @@ elif st.session_state.current_page == "⚠️ Аномалии":
                 c[4].write(f":green[+{row['Дельта']}]")
 
                 # Ряд кнопок быстрой классификации
-                btn_cols = st.columns(5)
+                # Увеличили до 6 колонок для новой кнопки
+                btn_cols = st.columns(6)
                 reasons = [
                     ("Тихая отмена", "отмена"), 
                     ("Пересорт (Склад)", "склад"), 
                     ("Пересорт (1С)", "офис"), 
                     ("Излишек", "плюс"), 
-                    ("Утеря", "минус")
+                    ("Утеря", "минус"),
+                    ("Системная ошибка", "sys_err") # НОВАЯ КНОПКА
                 ]
 
                 for i, (label, key_suffix) in enumerate(reasons):
                     if btn_cols[i].button(label, key=f"anom_{idx}_{key_suffix}", use_container_width=True):
                         price = df_inv[df_inv['Наименование'] == row['Наименование']]['Цена'].values[0] if not df_inv.empty else 0
                         
+                        # НОВАЯ ЛОГИКА: Если это системная ошибка, сразу закрываем её
+                        # Чтобы она не висела в "Задачах" и не требовала проверки
+                        final_status = "Закрыта" if label == "Системная ошибка" else "Открыта"
+                        
                         anomaly_data = {
                             "item_name": row['Наименование'],
                             "anomaly_type": label,
                             "qty_system": row['Стало'],
                             "qty_physical": row['Было'], 
-                            "financial_impact": abs(row['Дельта'] * price),
+                            "financial_impact": abs(row['Дельта'] * price) if label != "Системная ошибка" else 0,
                             "source": "Автоматически",
-                            "status": "Открыта",
-                            "comment": ""
+                            "status": final_status, # ПРИМЕНЯЕМ СТАТУС
+                            "comment": "Автоматическое закрытие: системный сбой данных сайта" if label == "Системная ошибка" else ""
                         }
                         save_anomaly_to_db(anomaly_data)
                         st.success(f"Зафиксировано: {label}")
                         st.rerun()
             st.divider()
 
-# 3. СТРАНИЦА АРХИВА И KPI
-elif st.session_state.current_page == "✅ Архив":
+# 3. СТРАНИЦА ЭФФЕКТИВНОСТИ И KPI (бывший Архив)
+elif st.session_state.current_page == "🎯 Эффективность":
     
     # 🧪 ПЕРЕКЛЮЧАТЕЛЬ DEV MODE
     hc1, hc2 = st.columns([3, 1])
@@ -366,58 +406,174 @@ elif st.session_state.current_page == "✅ Архив":
     include_tests = hc2.checkbox("🧪 Тестовые данные", value=False, help="Показать тестовые записи для отладки")
     
     with get_connection() as conn:
+        # Добавляем status, detected_at и resolved_at для расчета MTTR
+        query = """
+            SELECT item_name, source, anomaly_type, status, detected_at, resolved_at 
+            FROM anomaly_log 
+            WHERE anomaly_type NOT IN ('Тестовая запись', 'Системная ошибка')
+        """
         if include_tests:
-            df_kpi = pd.read_sql_query("SELECT source, anomaly_type FROM anomaly_log", conn)
-        else:
-            df_kpi = pd.read_sql_query("SELECT source, anomaly_type FROM anomaly_log WHERE anomaly_type != 'Тестовая запись'", conn)
+            query = "SELECT item_name, source, anomaly_type, status, detected_at, resolved_at FROM anomaly_log"
+        df_kpi = pd.read_sql_query(query, conn)
         
     if df_kpi.empty:
         st.info("Пока нет данных для расчета KPI.")
     else:
+        # Получаем актуальный список неликвидов для сопоставления
+        df_dead = load_dead_stock_analysis()
+        # Создаем словарь: Название -> Статус заморозки
+        dead_map = dict(zip(df_dead['Наименование'], df_dead['Заморожен'])) if not df_dead.empty else {}
+
+        # Функция определения "индивидуального риска" для каждой строки
+        def get_item_risk_days(row):
+            if row['anomaly_type'] == 'Успешная сверка': return 0 # Сверки не считаем в риск
+            
+            is_frozen = dead_map.get(row['item_name'], False)
+            if is_frozen:
+                return 365  # Для неликвида риск — год
+            else:
+                return 90   # Для обычного товара — квартал (усредненно)
+
+        # Считаем риск для каждой найденной проактивной аномалии
+        proactive_df = df_kpi[
+            (df_kpi['source'].isin(['Автоматически', 'Вручную (План)'])) & 
+            (df_kpi['anomaly_type'] != 'Успешная сверка')
+        ].copy()
+        
+        # Применяем веса
+        if not proactive_df.empty:
+            proactive_df['risk_days'] = proactive_df.apply(get_item_risk_days, axis=1)
+            # Итого спасенных дней = Сумма (Риск товара - 1 день на обнаружение системой)
+            total_risk_days_saved = (proactive_df['risk_days'] - 1).sum()
+            proactive_issues = len(proactive_df)
+        else:
+            total_risk_days_saved = 0
+            proactive_issues = 0
+        
         # --- 1. ПАРАМЕТРЫ РУТИНЫ (Шаги) ---
         OVERHEAD_MINUTES = 20  
         MEDIAN_BATCH_SIZE = 17 
         min_per_item = OVERHEAD_MINUTES / MEDIAN_BATCH_SIZE
         
-	# 2. ПАРАМЕТРЫ КОММУНИКАЦИЙ (Activity-Based Costing)
-        # Сколько минут сжигает одна проблема, если её найдет клиент, а не мы?
+        # --- 2. ПАРАМЕТРЫ КОММУНИКАЦИЙ (Activity-Based Costing) ---
         TIME_WAREHOUSE_WAITING = 10 # мин. простоя кладовщика (дозвон, ожидание ответа, переупаковка)
         TIME_OFFICE_INVESTIGATION = 10 # мин. работы офиса (поиск в 1С, исправление документов)
         
         # Общая стоимость одной эскалации в человеко-минутах
         ESCALATION_COST_MIN = TIME_WAREHOUSE_WAITING + TIME_OFFICE_INVESTIGATION
         
-        # --- РАСЧЕТЫ ---
+        # --- 3. ПАРАМЕТРЫ OPEX (Печать) ---
+        # Средняя стоимость 1 листа А4: Бумага (~0.6₽) + Тонер (~0.4₽) + Амортизация принтера (~0.2₽)
+        COST_PER_SHEET_RUB = 1.2 
+        opex_per_item = COST_PER_SHEET_RUB / MEDIAN_BATCH_SIZE
+
+        # --- 4. ПАРАМЕТРЫ ЗАДЕРЖКИ (Information Latency) ---
+        # Если бы не система, ошибка висела бы в среднем 90 дней (цикл полной сверки)
+        AVG_MANUAL_DETECTION_DAYS = 90 
+
+        # --- 5. РАСЧЕТ MEDIAN TIME TO RESOLVE (MTTR) ---
+        resolved_tasks = df_kpi[
+            (df_kpi['status'] == 'Закрыта') & 
+            (df_kpi['anomaly_type'] != 'Успешная сверка') & 
+            (df_kpi['detected_at'].notnull()) & 
+            (df_kpi['resolved_at'].notnull())
+        ].copy()
+        
+        if not resolved_tasks.empty:
+            resolved_tasks['detected_at'] = pd.to_datetime(resolved_tasks['detected_at'])
+            resolved_tasks['resolved_at'] = pd.to_datetime(resolved_tasks['resolved_at'])
+            # Считаем разницу и берем МЕДИАНУ вместо среднего
+            resolve_times = (resolved_tasks['resolved_at'] - resolved_tasks['detected_at']).dt.total_seconds() / 3600.0
+            mttr_median = resolve_times[resolve_times > 0].median() 
+            if pd.isna(mttr_median): mttr_median = 0.0
+        else:
+            mttr_median = 0.0
+            
+        # Форматирование вывода
+        if 0 < mttr_median < 1:
+            mttr_display = f"{mttr_median * 60:.0f} мин."
+        else:
+            mttr_display = f"{mttr_median:.1f} ч."
+
+        # ОПРЕДЕЛЕНИЕ ЦВЕТА И НОРМЫ (SLA)
+        # Норма для склада: закрытие аномалии в течение 4-х часов (одна рабочая смена)
+        S_MTTR_NORM = 4.0 
+        mttr_delta_color = "normal" if mttr_median <= S_MTTR_NORM else "inverse"
+
+        # --- РАСЧЕТЫ (Порядок важен для предотвращения NameError) ---
         total_checks = len(df_kpi)
         
-        # Экономия 1: Ногами (все проверки)
-        routine_saved_hours = (total_checks * min_per_item) / 60
-        
-        # Считаем только РЕАЛЬНЫЕ проблемы, найденные ДО прихода клиента
-        # (Успешная сверка - это не проблема, мы её исключаем из этого расчета)
+        # Сначала считаем количество реальных проблем, найденных ДО прихода клиента
         proactive_issues = len(df_kpi[
             (df_kpi['source'].isin(['Автоматически', 'Вручную (План)'])) & 
             (df_kpi['anomaly_type'] != 'Успешная сверка')
         ])
         
-        # Экономия 2: Головой и языком (предотвращенные звонки)
+        # Теперь считаем все производные метрики
+        routine_saved_hours = (total_checks * min_per_item) / 60
         communication_saved_hours = (proactive_issues * ESCALATION_COST_MIN) / 60
-        
-        # ИТОГО
         total_saved_hours = routine_saved_hours + communication_saved_hours
         
-        # Расчет Proactive Rate
+        total_opex_saved = total_checks * opex_per_item
+        sheets_saved = total_checks / MEDIAN_BATCH_SIZE
+        trees_saved = sheets_saved / 10000 # 1 дерево ≈ 10 000 листов А4
+        
+        # Суммарно предотвращено дней риска (на базе уже рассчитанного proactive_issues)
+        total_risk_days_saved = proactive_issues * (AVG_MANUAL_DETECTION_DAYS - 1)
+        
         proactive_count = len(df_kpi[df_kpi['source'].isin(['Автоматически', 'Вручную (План)'])])
         proactive_rate = (proactive_count / total_checks) * 100 if total_checks > 0 else 0
+
+        # --- ПОДГОТОВКА ФОРМАТА ВРЕМЕНИ ---
+        display_h = int(total_saved_hours)
+        display_m = int(round((total_saved_hours - display_h) * 60))
+        # Обработка случая, когда округление дает 60 минут
+        if display_m == 60:
+            display_h += 1
+            display_m = 0
+        time_str = f"{display_h} ч. {display_m} мин."
+
+        # --- ОТРИСОВКА ДАШБОРДА (Сетка 3х2 с обновленным неймингом) ---
         
-        # Отрисовка дашборда
-        kc1, kc2, kc3 = st.columns(3)
-        kc1.metric("Сэкономлено времени (Итого)", f"{total_saved_hours:.1f} ч.", 
-                  help=f"Рутина (ноги): {routine_saved_hours:.1f}ч + Коммуникации (звонки): {communication_saved_hours:.1f}ч")
-        kc2.metric("Предотвращено эскалаций", proactive_issues, 
-                  help=f"Ошибки, найденные проактивно. Каждая сэкономила ~{ESCALATION_COST_MIN} мин. разборок с офисом")
-        kc3.metric("Proactive Rate", f"{proactive_rate:.1f}%", delta="Цель: 100%")
-        st.progress(proactive_rate / 100.0)
+        # Строка 1: Управление рисками и временем
+        r1_c1, r1_c2, r1_c3 = st.columns(3)
+        
+        with r1_c1:
+            st.metric("Risk - Предотвращено риска", f"{total_risk_days_saved:,.0f} дн.".replace(',', ' '), 
+                      delta="MTTD: <24ч", delta_color="off",
+                      help=f"Суммарный лаг обнаружения. 365 дн. для неликвидов и {AVG_MANUAL_DETECTION_DAYS} дн. для активного стока.")
+            
+        with r1_c2:
+            # Передвинули MTTR на второе место первой строки
+            st.metric("MTTR - Время устранения", mttr_display, 
+                      delta=f"SLA: {S_MTTR_NORM}ч", delta_color=mttr_delta_color,
+                      help=f"""
+                      Median Time to Resolve: показатель операционной дисциплины. 
+                      Показывает типичное время реакции склада на проблему. 
+                      Норма (SLA): до {S_MTTR_NORM} часов.
+                      """)
+            
+        with r1_c3:
+            st.metric("Time - Сэкономлено времени", time_str, 
+                      help=f"Рутина: {routine_saved_hours:.2f}ч + Коммуникации: {communication_saved_hours:.2f}ч")
+
+        st.write("") # Отступ между строками
+
+        # Строка 2: Качество, Финансы и Экология
+        r2_c1, r2_c2, r2_c3 = st.columns(3)
+        
+        with r2_c1:
+            # Передвинули Proactive Rate на первое место второй строки
+            st.metric("PR - Проактивность", f"{proactive_rate:.1f}%")
+            st.progress(proactive_rate / 100.0)
+            
+        with r2_c2:
+            st.metric("OPEX - Снижение затрат", f"{total_opex_saved:.2f} ₽", 
+                      help=f"Сэкономлено {sheets_saved:.2f} листов А4. Расчет: {COST_PER_SHEET_RUB}₽/лист")
+            
+        with r2_c3:
+            st.metric("ESG - Eco Impact", f"{trees_saved:.5f} 🌳", 
+                      help=f"Сохранено деревьев исходя из объема нераспечатанной бумаги ({sheets_saved:.2f} стр.)")
 
     st.divider()
     st.subheader("📜 История выявленных проблем")
@@ -425,6 +581,7 @@ elif st.session_state.current_page == "✅ Архив":
     with get_connection() as conn:
         # Формируем SQL-запрос для истории в зависимости от галочки
         if include_tests:
+            # В режиме теста видим всё (включая системные ошибки и тесты)
             query = """
                 SELECT detected_at, resolved_at, item_name, anomaly_type, qty_physical, source, comment 
                 FROM anomaly_log 
@@ -432,10 +589,11 @@ elif st.session_state.current_page == "✅ Архив":
                 ORDER BY resolved_at DESC
             """
         else:
+            # В рабочем режиме скрываем мусор: тесты, системные баги и рутинные сверки
             query = """
                 SELECT detected_at, resolved_at, item_name, anomaly_type, qty_physical, source, comment 
                 FROM anomaly_log 
-                WHERE status != 'Открыта' AND anomaly_type NOT IN ('Успешная сверка', 'Тестовая запись')
+                WHERE status != 'Открыта' AND anomaly_type NOT IN ('Успешная сверка', 'Тестовая запись', 'Системная ошибка')
                 ORDER BY resolved_at DESC
             """
         df_history = pd.read_sql_query(query, conn)
@@ -565,7 +723,7 @@ elif st.session_state.current_page == "🔥 Задачи":
                                           key=f"note_{row['id']}")
                 
                 bc1, bc2 = st.columns(2)
-                if bc1.button("✅ Вопрос решен (в Архив)", key=f"close_{row['id']}", use_container_width=True):
+                if bc1.button("✅ Вопрос решен (в 🎯 Эффективность)", key=f"close_{row['id']}", use_container_width=True):
                     # Используем готовую функцию-обертку, которую мы создали ранее!
                     close_anomaly_in_db(row['id'], final_note)
                     st.rerun()

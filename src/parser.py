@@ -128,7 +128,8 @@ def init_db() -> sqlite3.Connection:
             )
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_report_date ON stocks(report_timestamp);')
-        conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_daily_item ON stocks(SUBSTR(report_timestamp, 1, 10), item_name);')
+        conn.execute('DROP INDEX IF EXISTS idx_unique_daily_item;')
+        conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_daily_item ON stocks(SUBSTR(report_timestamp, 1, 10), item_name, sku);')
         
         # 1. СТАРАЯ ТАБЛИЦА: ОСНОВНАЯ ИСТОРИЯ СКЛАДА (остается для совместимости)
         # 2. НОВАЯ ТАБЛИЦА: РЕЕСТР ОПЕРАЦИОННЫХ АНОМАЛИЙ
@@ -162,7 +163,7 @@ def save_to_db(conn: sqlite3.Connection, products: List[Product]) -> None:
         conn.executemany('''
             INSERT INTO stocks (report_timestamp, sku, item_name, price, quantity, total_value, category, product_url)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(SUBSTR(report_timestamp, 1, 10), item_name) DO UPDATE SET
+            ON CONFLICT(SUBSTR(report_timestamp, 1, 10), item_name, sku) DO UPDATE SET
                 report_timestamp = excluded.report_timestamp,
                 sku = excluded.sku,
                 price = excluded.price,
@@ -229,7 +230,7 @@ def extract_products(soup: BeautifulSoup, url: str) -> List[Product]:
         if len(cols) < 4: continue
         
         name = cols[1].get_text(strip=True)
-        sku = cols[2].get_text(strip=True) or None
+        sku = cols[2].get_text(strip=True) or ""
         
         price_span = cols[3].find('span', class_='actual')
         price = 0.0
