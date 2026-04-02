@@ -9,7 +9,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from queries import get_anomalies_query
 
 # --- НАСТРОЙКИ ---
-logging.basicConfig(level=logging.INFO, format="%(message)s")
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "data" / "stock_history.sqlite"

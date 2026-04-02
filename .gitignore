@@ -25,3 +25,10 @@ logs/*
 *.csv
 *.xlsx
 *.sqlite
+data/*
+!data/.gitkeep
+
+# Временные файлы SQLite и чекпоинты
+*.sqlite-shm
+*.sqlite-wal
+crawler_state.json
