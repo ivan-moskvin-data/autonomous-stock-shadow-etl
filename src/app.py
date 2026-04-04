@@ -43,11 +43,12 @@ st.markdown("<style>#MainMenu {visibility: hidden;} footer {visibility: hidden;}
 # --- ИНИЦИАЛИЗАЦИЯ ПАМЯТИ ---
 if 'dismissed_names' not in st.session_state:
     st.session_state.dismissed_names = []
-    # Восстанавливаем состояние из базы данных после перезагрузки страницы
     if DB_PATH.exists():
         try:
             with sqlite3.connect(DB_PATH) as conn:
-                # Ищем товары, по которым за последние 24 часа уже было принято решение
+                # Создаем таблицу для хранения связей старых и новых имен
+                conn.execute("CREATE TABLE IF NOT EXISTS item_aliases (new_name TEXT, old_name TEXT)")
+                conn.commit()
                 res = conn.execute("SELECT DISTINCT item_name FROM anomaly_log WHERE detected_at >= datetime('now', '-1 day', 'localtime')").fetchall()
                 st.session_state.dismissed_names = [r[0] for r in res]
         except Exception:
@@ -169,17 +170,89 @@ def load_dead_stock_analysis() -> pd.DataFrame:
     return res
 
 @st.cache_data(ttl=3600)
-def load_velocity_history(item_name: str) -> pd.DataFrame:
+def load_velocity_history(item_name: str, sku: str = "") -> pd.DataFrame:
     if not DB_PATH.exists() or not item_name: return pd.DataFrame()
-    with get_connection() as conn:
-        query = "SELECT SUBSTR(report_timestamp, 1, 10) as 'Дата', quantity as 'Остаток' FROM stocks WHERE item_name = :item_name AND report_timestamp >= date('now', '-365 days') ORDER BY report_timestamp ASC"
-        df = pd.read_sql_query(query, conn, params={"item_name": item_name})
+    
+    # Вспомогательная функция, чтобы не дублировать код
+    def fetch_history_for_name(target_n, target_s=""):
+        safe_name = str(target_n).strip() if pd.notna(target_n) else ""
+        safe_sku = str(target_s).strip() if pd.notna(target_s) else ""
+        if safe_sku.lower() in ['nan', 'none', '<na>']: safe_sku = ""
         
-    if not df.empty:
-        df = df.drop_duplicates(subset=['Дата'], keep='last')
-        df['Дата'] = pd.to_datetime(df['Дата'])
-        df.set_index('Дата', inplace=True)
-    return df
+        with get_connection() as conn:
+            first_word = safe_name.split()[0] if safe_name else ""
+            # ДОБАВЛЕНО: report_timestamp перед FROM
+            query = "SELECT item_name, sku, SUBSTR(report_timestamp, 1, 10) as 'Дата', quantity as 'Остаток', report_timestamp FROM stocks WHERE report_timestamp >= date('now', '-365 days') AND item_name LIKE :fw_pattern"
+            df = pd.read_sql_query(query, conn, params={"fw_pattern": f"{first_word}%"})
+            
+        if not df.empty:
+            df['clean_name'] = df['item_name'].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True).str.lower().str.replace('ё', 'е')
+            df['clean_sku'] = df['sku'].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True).str.lower().str.replace('ё', 'е')
+            tcn = pd.Series([safe_name]).str.strip().str.replace(r'\s+', ' ', regex=True).str.lower().str.replace('ё', 'е')[0]
+            tcs = pd.Series([safe_sku]).str.strip().str.replace(r'\s+', ' ', regex=True).str.lower().str.replace('ё', 'е')[0]
+            
+            mask = (df['clean_name'] == tcn)
+            if tcs: mask &= (df['clean_sku'] == tcs)
+            df = df[mask].copy()
+            
+            if not df.empty:
+                df = df.sort_values('report_timestamp', ascending=True).drop_duplicates(subset=['Дата'], keep='last')
+                df['Дата'] = pd.to_datetime(df['Дата'])
+                return df[['Дата', 'Остаток']].set_index('Дата')
+        return pd.DataFrame()
+
+    # 1. Загружаем историю текущего имени
+    combined_df = fetch_history_for_name(item_name, sku)
+    
+    # 2. Ищем алиасы (старые названия) в базе
+    with get_connection() as conn:
+        try:
+            aliases = conn.execute("SELECT old_name FROM item_aliases WHERE new_name = ?", (item_name,)).fetchall()
+        except sqlite3.OperationalError:
+            aliases = [] # Защита, если таблица еще не создалась
+            
+    # 3. Подгружаем историю старых названий и сшиваем с новой
+    for (old_name,) in aliases:
+        alias_df = fetch_history_for_name(old_name, "")
+        if not alias_df.empty:
+            combined_df = pd.concat([combined_df, alias_df]) if not combined_df.empty else alias_df
+            
+    # 4. Финальная очистка сшитого графика
+    if not combined_df.empty:
+        combined_df = combined_df.sort_index()
+        # Если в день смены названия есть оба остатка, оставляем самый свежий
+        combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
+        
+    return combined_df
+
+@st.cache_data(ttl=3600)
+def get_all_historical_items() -> dict:
+    """Выгружает все имена, артикулы и статусы актуальности за всю историю"""
+    if not DB_PATH.exists(): return {}
+    with get_connection() as conn:
+        # Получаем дату последнего парсинга (самую свежую в БД)
+        latest_db_date = conn.execute("SELECT MAX(SUBSTR(report_timestamp, 1, 10)) FROM stocks").fetchone()[0]
+
+        # Группируем, чтобы получить уникальные имена, их артикулы и дату последнего появления
+        query = """
+            SELECT item_name, MAX(sku) as sku, MAX(SUBSTR(report_timestamp, 1, 10)) as last_seen 
+            FROM stocks 
+            WHERE item_name != '' 
+            GROUP BY item_name
+        """
+        res = conn.execute(query).fetchall()
+        
+        # Формируем расширенный словарь данных
+        result = {}
+        for row in res:
+            name = row[0]
+            sku = row[1] if row[1] else "Без артикула"
+            last_seen = row[2]
+            # Если дата последней фиксации меньше сегодняшней, значит товар снят с сайта
+            is_active = (last_seen == latest_db_date) 
+            result[name] = {"sku": sku, "is_active": is_active, "last_seen": last_seen}
+            
+        return result
 
 def save_anomaly_to_db(data: dict):
     """Записывает инцидент в базу и сбрасывает кэш для обновления экрана"""
@@ -341,6 +414,7 @@ if st.session_state.current_page == "📦 Склад":
                 
                 if btn_c[0].button("📈", key=f"v_{row['ID']}", help="График оборачиваемости"):
                     st.session_state.selected_item_name = row['Наименование']
+                    st.session_state.selected_item_sku = row['Артикул'] 
                     st.session_state.current_page = "📈 Оборачиваемость"
                     st.rerun()
                 
@@ -490,6 +564,30 @@ if st.session_state.current_page == "📦 Склад":
                 }
             )
 
+            # --- НОВЫЙ БЛОК: ИСЧЕЗНУВШИЕ ТОВАРЫ ---
+            if len(df_stats) > 1:
+                yesterday_date = df_stats.iloc[1]['parse_date']
+                
+                # Ищем товары, которые парсер видел вчера, но не увидел сегодня
+                lost_items = df_inv[(df_inv['last_seen_date'] == yesterday_date) & (~df_inv['actual'])]
+                
+                if not lost_items.empty:
+                    with st.expander(f"📉 Сняты с сайта при последнем парсинге ({len(lost_items)} шт.)"):
+                        st.caption(f"Эти позиции были в выгрузке за {yesterday_date}, но сегодня отсутствуют.")
+                        display_lost = lost_items[['Артикул', 'Наименование', 'Цена', 'Остаток']].copy()
+                        
+                        st.dataframe(
+                            display_lost, 
+                            use_container_width=True, 
+                            hide_index=True,
+                            column_config={
+                                "Цена": st.column_config.NumberColumn(format="%d ₽"),
+                                "Остаток": st.column_config.NumberColumn(format="%d шт.")
+                            }
+                        )
+                else:
+                    st.success("✅ С момента прошлого парсинга ни один товар не пропал с сайта.")
+
 # 2. СТРАНИЦА АНОМАЛИЙ
 elif st.session_state.current_page == "⚠️ Аномалии":
     active_anom = df_anomalies[~df_anomalies['Наименование'].isin(st.session_state.dismissed_names)] if not df_anomalies.empty else pd.DataFrame()
@@ -508,50 +606,162 @@ elif st.session_state.current_page == "⚠️ Аномалии":
                 c[3].write(row['Стало'])
                 c[4].write(f":green[+{row['Дельта']}]")
 
-                # Ряд кнопок быстрой классификации
-                reasons = [
-                    ("Тихая отмена", "отмена"), 
-                    ("Пересорт (Склад)", "склад"), 
-                    ("Пересорт (1С)", "офис"), 
-                    ("Излишек", "плюс"), 
-                    ("Утеря", "минус"),
-                    ("Системная ошибка", "sys_err"),
-                    ("📦 Плановый приход", "delivery"), 
-                    ("⏳ Догруз с сайта", "late_sync") # <--- НОВАЯ КНОПКА
-                ]
-                # Делаем колонки динамическими под количество кнопок
-                btn_cols = st.columns(len(reasons))
+                # Умная группировка кнопок (Сетка 3x3 вместо одной длинной строки)
+                # Ряд 1: Негативные инциденты (Потери и сбои)
+                row1 = [("Утеря", "минус"), ("Тихая отмена", "отмена"), ("Системная ошибка", "sys_err")]
+                # Ряд 2: Пересорты и излишки (Смещение остатков)
+                row2 = [("Пересорт (Склад)", "склад"), ("Пересорт (1С)", "офис"), ("Излишек", "плюс")]
+                # Ряд 3: Рутина и автоматизация (Системные корректировки)
+                row3 = [("📦 Плановый приход", "delivery"), ("⏳ Догруз с сайта", "late_sync"), ("🔄 Обновление карточки", "card_update")]
+                
+                grid = [row1, row2, row3]
 
-                for i, (label, key_suffix) in enumerate(reasons):
-                    if btn_cols[i].button(label, key=f"anom_{idx}_{key_suffix}", use_container_width=True):
-                        price = df_inv[df_inv['Наименование'] == row['Наименование']]['Цена'].values[0] if not df_inv.empty else 0
+                # Отрисовываем сетку
+                for button_row in grid:
+                    btn_cols = st.columns(len(button_row))
+                    for i, (label, key_suffix) in enumerate(button_row):
                         
-                        # Закрываем сразу, если это рутина или сбой
-                        final_status = "Закрыта" if label in ["Системная ошибка", "📦 Плановый приход", "⏳ Догруз с сайта"] else "Открыта"
-                        
-                        # Авто-комментарии для рутины
-                        auto_comment = ""
-                        if label == "📦 Плановый приход":
-                            auto_comment = "Штатное поступление товара"
-                        elif label == "⏳ Догруз с сайта":
-                            auto_comment = "Запоздалая выгрузка остатков витрины"
-                        
-                        anomaly_data = {
+                        # Наша кнопка вызова меню склейки
+                        if label == "🔄 Обновление карточки":
+                            if btn_cols[i].button(label, key=f"anom_{idx}_{key_suffix}", use_container_width=True):
+                                st.session_state.link_target_idx = idx
+                                st.rerun()
+                        else:
+                            # Логика для всех остальных обычных кнопок
+                            if btn_cols[i].button(label, key=f"anom_{idx}_{key_suffix}", use_container_width=True):
+                                price = df_inv[df_inv['Наименование'] == row['Наименование']]['Цена'].values[0] if not df_inv.empty else 0
+                                final_status = "Закрыта" if label in ["Системная ошибка", "📦 Плановый приход", "⏳ Догруз с сайта"] else "Открыта"
+                                
+                                auto_comment = ""
+                                if label == "📦 Плановый приход": auto_comment = "Штатное поступление товара"
+                                elif label == "⏳ Догруз с сайта": auto_comment = "Запоздалая выгрузка остатков витрины"
+                                
+                                anomaly_data = {
+                                    "item_name": row['Наименование'],
+                                    "anomaly_type": label,
+                                    "qty_system": row['Стало'],
+                                    "qty_physical": row['Было'], 
+                                    "financial_impact": abs(row['Дельта'] * price) if label not in ["Системная ошибка", "📦 Плановый приход", "⏳ Догруз с сайта"] else 0,
+                                    "source": "Автоматически",
+                                    "status": final_status, 
+                                    "comment": auto_comment
+                                }
+                                save_anomaly_to_db(anomaly_data)
+                                st.session_state.dismissed_names.append(row['Наименование'])
+                                st.success(f"Зафиксировано: {label}")
+                                st.rerun()
+
+                # --- МЕНЮ СКЛЕЙКИ ИСТОРИИ (КАК НА СКЛАДЕ) ---
+                if st.session_state.get('link_target_idx') == idx:
+                    st.write("---")
+                    
+                    # Верхний ряд с кнопками пропуска и отмены (чтобы всегда были под рукой)
+                    col_top1, col_top2 = st.columns([3, 1])
+                    if col_top1.button("⏭️ Просто обновить карточку (БЕЗ склейки с историей)", key=f"skip_link_{idx}"):
+                        save_anomaly_to_db({
                             "item_name": row['Наименование'],
-                            "anomaly_type": label,
+                            "anomaly_type": "🔄 Обновление карточки",
                             "qty_system": row['Стало'],
                             "qty_physical": row['Было'], 
-                            # Ущерб = 0 для технических кнопок
-                            "financial_impact": abs(row['Дельта'] * price) if label not in ["Системная ошибка", "📦 Плановый приход", "⏳ Догруз с сайта"] else 0,
+                            "financial_impact": 0,
                             "source": "Автоматически",
-                            "status": final_status, 
-                            "comment": auto_comment
-                        }
-                        
-                        save_anomaly_to_db(anomaly_data)
+                            "status": "Закрыта", 
+                            "comment": "Изменилось название на сайте"
+                        })
                         st.session_state.dismissed_names.append(row['Наименование'])
-                        st.success(f"Зафиксировано: {label}")
+                        st.session_state.link_target_idx = None
                         st.rerun()
+                        
+                    if col_top2.button("❌ Отмена", key=f"cancel_link_{idx}"):
+                        st.session_state.link_target_idx = None
+                        st.rerun()
+
+                    st.write("") # Небольшой отступ
+
+                    # 1. Поле ручного поиска (один в один как на складе)
+                    search_query = st.text_input("🔍 Поиск старой карточки для привязки:", 
+                                                placeholder="Артикул или название...",
+                                                key=f"search_link_{idx}")
+
+                    matched_df = pd.DataFrame()
+                    
+                    # 2. Движок поиска от вкладки Склад
+                    if search_query:
+                        import re
+                        # Убиваем мусорные значки
+                        clean_query = re.sub(r'\(снят с сайта.*?\)', '', search_query, flags=re.IGNORECASE)
+                        clean_query = clean_query.replace('🔘', '').replace('❌', '').strip()
+                        query_words = clean_query.lower().replace('ё', 'е').split()
+                        
+                        if query_words:
+                            mask = pd.Series(True, index=df_inv.index)
+                            for word in query_words: 
+                                mask &= df_inv['_search_index'].str.contains(word, regex=False)
+                            
+                            matched_df = df_inv[mask].copy()
+                            # ПРИОРИТЕТ: Сортируем так, чтобы неактивные (снятые с сайта) были на самом верху
+                            matched_df = matched_df.sort_values(by='actual', ascending=True).head(30)
+                            st.caption(f"🔍 Найдено: {len(df_inv[mask])}. Показаны первые 30.")
+                    else:
+                        # Если ничего не введено, показываем кандидатов, пропавших с сайта
+                        today_lost = df_anomalies[
+                            (df_anomalies['Дельта'] < 0) & 
+                            (~df_anomalies['Наименование'].isin(st.session_state.dismissed_names))
+                        ]['Наименование'].tolist()
+                        
+                        mask1 = df_inv['Наименование'].isin(today_lost)
+                        mask2 = ~df_inv['actual']
+                        matched_df = df_inv[mask1 | mask2].sort_values(by='actual', ascending=True).head(10).copy()
+                        st.caption("Показаны недавно пропавшие товары. Используйте поиск, чтобы найти другие.")
+
+                    # 3. ОТРИСОВКА РЕЗУЛЬТАТОВ КАК НА СКЛАДЕ (Таблица вместо списка)
+                    if not matched_df.empty:
+                        hc = st.columns([2, 4, 2, 2])
+                        for i, h in enumerate(["Артикул", "Наименование", "Статус", "Действие"]): 
+                            hc[i].write(f"**{h}**")
+                        st.divider()
+                        
+                        for matched_idx, m_row in matched_df.iterrows():
+                            c = st.columns([2, 4, 2, 2])
+                            c[0].write(m_row['Артикул'])
+                            
+                            display_name = m_row['Наименование']
+                            if not m_row['actual']:
+                                c[1].write(f"🔘 {display_name}")
+                                c[2].write(f"❌ Снят ({m_row['last_seen_date']})")
+                            else:
+                                c[1].write(display_name)
+                                c[2].write("✅ Активен")
+                                
+                            # Кнопка склейки прямо в строке товара!
+                            if c[3].button("🔗 Склеить", key=f"do_link_{idx}_{matched_idx}", type="primary"):
+                                old_name = m_row['Наименование']
+                                with get_connection() as conn:
+                                    conn.execute("INSERT INTO item_aliases (new_name, old_name) VALUES (?, ?)", (row['Наименование'], old_name))
+                                    conn.execute("""
+                                        INSERT INTO anomaly_log (detected_at, item_name, anomaly_type, qty_system, qty_physical, financial_impact, source, status, comment)
+                                        VALUES (datetime('now', 'localtime'), ?, '🔄 Обновление карточки', 0, 0, 0, 'Автоматически', 'Закрыта', ?)
+                                    """, (old_name, f"🔗 Склеено (старое имя). Новое: {row['Наименование']}"))
+                                    conn.commit()
+                                if old_name not in st.session_state.dismissed_names:
+                                    st.session_state.dismissed_names.append(old_name)
+
+                                save_anomaly_to_db({
+                                    "item_name": row['Наименование'],
+                                    "anomaly_type": "🔄 Обновление карточки",
+                                    "qty_system": row['Стало'],
+                                    "qty_physical": row['Было'], 
+                                    "financial_impact": 0,
+                                    "source": "Автоматически",
+                                    "status": "Закрыта", 
+                                    "comment": f"Склейка: {old_name}"
+                                })
+                                st.session_state.dismissed_names.append(row['Наименование'])
+                                st.session_state.link_target_idx = None
+                                st.rerun()
+                            st.divider()
+                    else:
+                        st.info("По вашему запросу ничего не найдено.")
             st.divider()
 
 # 3. СТРАНИЦА ЭФФЕКТИВНОСТИ И KPI (бывший Архив)
@@ -560,14 +770,14 @@ elif st.session_state.current_page == "🎯 Эффективность":
     # 🧪 ПЕРЕКЛЮЧАТЕЛЬ DEV MODE
     hc1, hc2 = st.columns([3, 1])
     hc1.subheader("🎯 KPI: Эффективность и Качество (Lean Model)")
-    include_tests = hc2.checkbox("🧪 Тестовые данные", value=False, help="Показать тестовые записи для отладки")
+    include_tests = hc2.checkbox("🧪 Тестовые данные и баги", value=False, help="Показать тестовые записи для отладки")
     
     with get_connection() as conn:
         # Добавляем status, detected_at и resolved_at для расчета MTTR
         query = """
             SELECT item_name, source, anomaly_type, status, detected_at, resolved_at 
             FROM anomaly_log 
-            WHERE anomaly_type NOT IN ('Тестовая запись', 'Системная ошибка', '📦 Плановый приход', '⏳ Догруз с сайта')
+            WHERE anomaly_type NOT IN ('Тестовая запись', 'Системная ошибка', '📦 Плановый приход', '⏳ Догруз с сайта', '🔄 Обновление карточки')
         """
         if include_tests:
             query = "SELECT item_name, source, anomaly_type, status, detected_at, resolved_at FROM anomaly_log"
@@ -734,18 +944,18 @@ elif st.session_state.current_page == "🎯 Эффективность":
 
     st.divider()
 
-    # --- РАЗДЕЛ 1: SYSTEM IQ (На всю ширину) ---
-    st.subheader("🤖 System IQ (Health & Intel)")
+    # --- РАЗДЕЛ 1: SYSTEM IQ (Дневная динамика) ---
+    st.subheader("🤖 System IQ (Daily Health & Intel)")
     with get_connection() as conn:
-        # ЛОГИКА: Тесты прячем, если галочка снята. Баги (Failures) и сигналы остаются ВСЕГДА!
+        # Прячем тесты, если галочка не стоит
         iq_where = "" if include_tests else "WHERE anomaly_type != 'Тестовая запись'"
         
         iq_query = f"""
             SELECT 
-                STRFTIME('%Y-%m', detected_at) as Month,
+                DATE(detected_at) as Day, -- Меняем месяц на конкретный день
                 CASE 
                     WHEN IFNULL(comment, '') LIKE '%[BUG]%' THEN 'Failures'
-                    WHEN anomaly_type IN ('📦 Плановый приход', '⏳ Догруз с сайта') THEN 'Automated'
+                    WHEN anomaly_type IN ('📦 Плановый приход', '⏳ Догруз с сайта', '🔄 Обновление карточки') THEN 'Automated'
                     WHEN anomaly_type IN ('Системная ошибка') THEN 'Failures'
                     WHEN anomaly_type IN ('Тестовая запись') THEN 'Debug'
                     ELSE 'Signal'
@@ -754,54 +964,84 @@ elif st.session_state.current_page == "🎯 Эффективность":
             FROM anomaly_log
             {iq_where}
             GROUP BY 1, 2
+            ORDER BY Day ASC -- Сортируем по дате для правильного графика
         """
         df_iq = pd.read_sql_query(iq_query, conn)
     
     if not df_iq.empty:
-        chart_iq = df_iq.pivot(index='Month', columns='cat', values='count').fillna(0)
+        # Список всех доступных категорий
+        all_cats = sorted(df_iq['cat'].unique().tolist())
         
-        color_map_iq = {
-            'Automated': '#3498db', # Синий
-            'Debug': '#95a5a6',     # Серый
-            'Failures': '#e74c3c',  # Красный (БАГИ БУДУТ ЗДЕСЬ)
-            'Signal': '#2ecc71'     # Зеленый
-        }
-        active_cols_iq = chart_iq.columns.tolist()
-        iq_colors = [color_map_iq.get(col, '#000000') for col in active_cols_iq]
+        # Виджет выбора категорий (по умолчанию выбраны все)
+        selected_cats = st.multiselect(
+            "🔎 Детализация System IQ (выберите категории для сравнения):", 
+            options=all_cats, 
+            default=all_cats,
+            key="iq_filter"
+        )
         
-        st.area_chart(chart_iq, color=iq_colors) 
-        st.caption("🔵 **Automated:** Автоматизация | 🟢 **Signal:** Полезная работа | 🔴 **Failures:** Баги и сбои | ⚪ **Debug:** Тесты")
-    else:
-        st.info("Данные для расчета System IQ пока отсутствуют.")
+        # Фильтруем данные перед сводной таблицей
+        df_iq_filtered = df_iq[df_iq['cat'].isin(selected_cats)]
+        
+        if not df_iq_filtered.empty:
+            chart_iq = df_iq_filtered.pivot(index='Day', columns='cat', values='count').fillna(0)
+            
+            color_map_iq = {
+                'Automated': '#3498db', # Синий
+                'Debug': '#95a5a6',     # Серый
+                'Failures': '#e74c3c',  # Красный
+                'Signal': '#2ecc71'     # Зеленый
+            }
+            
+            # Подбираем цвета только для тех колонок, которые остались
+            current_colors = [color_map_iq.get(col, '#000000') for col in chart_iq.columns]
+            
+            st.area_chart(chart_iq, color=current_colors) 
+            st.caption("🔵 **Automated:** Автоматизация | 🟢 **Signal:** Полезная работа | 🔴 **Failures:** Баги и сбои | ⚪ **Debug:** Тесты")
+        else:
+            st.warning("Выберите хотя бы одну категорию для отображения графика.")
 
     st.write("---") # Визуальный разделитель между графиками
 
-    # --- РАЗДЕЛ 2: FEATURE ADOPTION (На всю ширину) ---
-    st.subheader("🖱️ Feature Adoption (Динамика UX)")
+    # --- РАЗДЕЛ 2: FEATURE ADOPTION (Дневная динамика UX) ---
+    st.subheader("🖱️ Feature Adoption (Daily UX)")
     with get_connection() as conn:
-        # ЛОГИКА: Из графика UX мы всегда ИСКЛЮЧАЕМ клики, помеченные как [BUG], 
-        # потому что баг кнопки - это не реальный выбор пользователя.
+        # Исключаем [BUG] и успешные сверки из статистики использования кнопок
         ad_where = "WHERE anomaly_type != 'Успешная сверка' AND IFNULL(comment, '') NOT LIKE '%[BUG]%'"
         if not include_tests:
-            ad_where += " AND anomaly_type NOT IN ('Тестовая запись', 'Системная ошибка')"
+            ad_where += " AND anomaly_type NOT IN ('Тестовая запись')"
         
         adoption_ts_query = f"""
             SELECT 
-                STRFTIME('%Y-%m', detected_at) as Month,
+                DATE(detected_at) as Day, -- Заменили месяц на день
                 anomaly_type,
                 COUNT(*) as count
             FROM anomaly_log
             {ad_where}
             GROUP BY 1, 2
+            ORDER BY Day ASC -- Сортировка для правильной временной шкалы
         """
         df_adoption_ts = pd.read_sql_query(adoption_ts_query, conn)
     
     if not df_adoption_ts.empty:
-        chart_adoption = df_adoption_ts.pivot(index='Month', columns='anomaly_type', values='count').fillna(0)
-        st.area_chart(chart_adoption)
-        st.caption("Показывает реальные клики. Баги интерфейса из этого графика исключены.")
-    else:
-        st.info("Нет данных о ручной классификации инцидентов.")
+        # Список всех типов кнопок
+        all_types = sorted(df_adoption_ts['anomaly_type'].unique().tolist())
+        
+        selected_types = st.multiselect(
+            "🔎 Фильтр кнопок (отключите лишние, чтобы изменить масштаб):", 
+            options=all_types, 
+            default=all_types,
+            key="ad_filter"
+        )
+        
+        df_ad_filtered = df_adoption_ts[df_adoption_ts['anomaly_type'].isin(selected_types)]
+        
+        if not df_ad_filtered.empty:
+            chart_adoption = df_ad_filtered.pivot(index='Day', columns='anomaly_type', values='count').fillna(0)
+            st.area_chart(chart_adoption)
+            st.caption("График показывает интенсивность использования каждой кнопки классификации по дням.")
+        else:
+            st.warning("Выберите типы кнопок для отображения.")
     
     st.divider()
 
@@ -810,69 +1050,79 @@ elif st.session_state.current_page == "🎯 Эффективность":
     
     with get_connection() as conn:
         if include_tests:
-            # В РЕЖИМЕ ТЕСТОВ: Показываем инциденты + Тесты + любые записи с тегом [BUG]
             query = """
-                SELECT id, detected_at, resolved_at, item_name, anomaly_type, qty_physical, source, comment 
-                FROM anomaly_log 
-                WHERE status != 'Открыта' 
+                SELECT 
+                    a.id, a.detected_at, a.resolved_at, a.item_name, a.anomaly_type, a.qty_physical, a.source, a.comment,
+                    (SELECT sku FROM stocks s WHERE s.item_name = a.item_name AND sku != '' ORDER BY report_timestamp DESC LIMIT 1) as sku
+                FROM anomaly_log a
+                WHERE a.status != 'Открыта' 
                   AND (
-                      anomaly_type NOT IN ('📦 Плановый приход', 'Успешная сверка', '⏳ Догруз с сайта')
-                      OR IFNULL(comment, '') LIKE '%[BUG]%'
+                      a.anomaly_type NOT IN ('📦 Плановый приход', 'Успешная сверка', '⏳ Догруз с сайта', '🔄 Обновление карточки')
+                      OR IFNULL(a.comment, '') LIKE '%[BUG]%'
                   )
-                ORDER BY resolved_at DESC LIMIT 50
+                ORDER BY a.resolved_at DESC LIMIT 50
             """
         else:
-            # В БОЕВОМ РЕЖИМЕ: Только чистые инциденты (без рутины и без багов)
             query = """
-                SELECT id, detected_at, resolved_at, item_name, anomaly_type, qty_physical, source, comment 
-                FROM anomaly_log 
-                WHERE status != 'Открыта' 
-                  AND anomaly_type NOT IN ('Тестовая запись', 'Системная ошибка', '📦 Плановый приход', 'Успешная сверка', '⏳ Догруз с сайта')
-                  AND IFNULL(comment, '') NOT LIKE '%[BUG]%'
-                ORDER BY resolved_at DESC LIMIT 50
+                SELECT 
+                    a.id, a.detected_at, a.resolved_at, a.item_name, a.anomaly_type, a.qty_physical, a.source, a.comment,
+                    (SELECT sku FROM stocks s WHERE s.item_name = a.item_name AND sku != '' ORDER BY report_timestamp DESC LIMIT 1) as sku
+                FROM anomaly_log a
+                WHERE a.status != 'Открыта' 
+                  AND a.anomaly_type NOT IN ('Тестовая запись', 'Системная ошибка', '📦 Плановый приход', 'Успешная сверка', '⏳ Догруз с сайта', '🔄 Обновление карточки')
+                  AND IFNULL(a.comment, '') NOT LIKE '%[BUG]%'
+                ORDER BY a.resolved_at DESC LIMIT 50
             """
         df_history = pd.read_sql_query(query, conn)
     
     if df_history.empty:
         st.info("В истории пока нет зафиксированных инцидентов.")
     else:
-        # Отрисовываем шапку кастомной таблицы
-        hc = st.columns([2, 3, 2, 1, 3, 1])
-        for col, title in zip(hc, ["Дата", "Наименование", "Тип", "Факт", "Комментарий", "Действие"]):
+        # Отрисовываем шапку кастомной таблицы (Теперь 8 колонок)
+        hc = st.columns([2, 2, 3, 2, 1, 2, 1, 1])
+        for col, title in zip(hc, ["Дата", "Артикул", "Наименование", "Тип", "Факт", "Комментарий", "Баг", "Откат"]):
             col.write(f"**{title}**")
         st.divider()
         
         # Отрисовываем каждую запись как строку
         for _, row in df_history.iterrows():
-            c = st.columns([2, 3, 2, 1, 3, 1])
+            c = st.columns([2, 2, 3, 2, 1, 2, 1, 1])
             
+            # 1. Дата
             c[0].caption(row['resolved_at'] or row['detected_at'])
-            c[1].write(row['item_name'])
+            
+            # 2. Артикул (НОВОЕ)
+            sku_text = row['sku'] if pd.notna(row['sku']) and row['sku'] else "Без артикула"
+            c[1].write(f"🏷️ {sku_text}")
+            
+            # 3. Наименование
+            c[2].write(row['item_name'])
             
             is_bug = "[BUG]" in str(row['comment'])
             
-            # Цветовое кодирование текста
+            # 4. Цветовое кодирование текста
             if is_bug:
-                c[2].write(f"🔴 :red[{row['anomaly_type']}]")
+                c[3].write(f"🔴 :red[{row['anomaly_type']}]")
             elif row['anomaly_type'] == 'Успешная сверка':
-                c[2].write(f":green[{row['anomaly_type']}]")
+                c[3].write(f":green[{row['anomaly_type']}]")
             elif row['anomaly_type'] in ['Излишек', 'Пересорт (Склад)', 'Пересорт (1С)']:
-                c[2].write(f":orange[{row['anomaly_type']}]")
+                c[3].write(f":orange[{row['anomaly_type']}]")
             elif row['anomaly_type'] in ['Утеря', 'Тихая отмена']:
-                c[2].write(f":red[{row['anomaly_type']}]")
+                c[3].write(f":red[{row['anomaly_type']}]")
             else:
-                c[2].write(row['anomaly_type'])
+                c[3].write(row['anomaly_type'])
                 
-            c[3].write(row['qty_physical'])
-            c[4].caption(str(row['comment']) if pd.notna(row['comment']) else "")
+            # 5. Факт
+            c[4].write(row['qty_physical'])
             
-            # Встраиваем кнопку действия прямо в строку
+            # 6. Комментарий
+            c[5].caption(str(row['comment']) if pd.notna(row['comment']) else "")
+            
+            # 7. Кнопка БАГ
             if is_bug:
-                # Если уже баг — показываем неактивную галочку
-                c[5].button("✅", key=f"bug_done_{row['id']}", disabled=True, help="Уже отмечено как баг")
+                c[6].button("✅", key=f"bug_done_{row['id']}", disabled=True, help="Уже отмечено как баг")
             else:
-                # Если нормальная запись — даем возможность пометить как баг
-                if c[5].button("🚨 Баг", key=f"mark_bug_{row['id']}", help="Пометить как сбой интерфейса/системы"):
+                if c[6].button("🚨", key=f"mark_bug_{row['id']}", help="Пометить как сбой интерфейса/системы"):
                     with get_connection() as conn:
                         conn.execute("""
                             UPDATE anomaly_log 
@@ -880,7 +1130,18 @@ elif st.session_state.current_page == "🎯 Эффективность":
                             WHERE id = ?
                         """, (row['id'],))
                         conn.commit()
-                    st.rerun() # Мгновенно обновляем интерфейс и графики
+                    st.rerun()
+            
+            # 8. КНОПКА ВОЗВРАТА В АНОМАЛИИ
+            if c[7].button("↩️", key=f"restore_hist_{row['id']}", help="Отменить решение и вернуть в Аномалии"):
+                with get_connection() as conn:
+                    conn.execute("DELETE FROM anomaly_log WHERE id = ?", (row['id'],))
+                    conn.commit()
+                if row['item_name'] in st.session_state.dismissed_names:
+                    st.session_state.dismissed_names.remove(row['item_name'])
+                
+                st.toast(f"Товар возвращен во вкладку Аномалии!")
+                st.rerun()
 
     st.divider()
     
@@ -889,61 +1150,82 @@ elif st.session_state.current_page == "🎯 Эффективность":
     st.caption("Постоянная память: здесь хранится история плановых поступлений и успешных сверок.")
     
     with get_connection() as conn:
-        # Исключаем любые записи, помеченные как [BUG]
         query_legal = """
-            SELECT id, detected_at, resolved_at, item_name, anomaly_type, qty_physical, source, comment 
-            FROM anomaly_log 
-            WHERE anomaly_type IN ('📦 Плановый приход', 'Успешная сверка', '⏳ Догруз с сайта')
-              AND IFNULL(comment, '') NOT LIKE '%[BUG]%'
-            ORDER BY detected_at DESC LIMIT 50
+            SELECT 
+                a.id, 
+                a.detected_at, 
+                a.item_name, 
+                a.anomaly_type, 
+                a.comment,
+                (a.qty_system - a.qty_physical) as delta,
+                (SELECT sku FROM stocks s WHERE s.item_name = a.item_name AND sku != '' ORDER BY report_timestamp DESC LIMIT 1) as sku
+            FROM anomaly_log a
+            WHERE a.anomaly_type IN ('📦 Плановый приход', 'Успешная сверка', '⏳ Догруз с сайта', '🔄 Обновление карточки')
+              AND IFNULL(a.comment, '') NOT LIKE '%[BUG]%'
+              AND IFNULL(a.comment, '') NOT LIKE '🔗 Склеено (старое имя)%'
+            ORDER BY a.detected_at DESC LIMIT 50
         """
         df_legal = pd.read_sql_query(query_legal, conn)
         
     if df_legal.empty:
-        st.info("В журнале рутины пока нет записей.")
+        st.info("Журнал рутинных операций пока пуст.")
     else:
-        # Отрисовываем шапку таблицы (такую же, как в Истории)
-        hc_leg = st.columns([2, 3, 2, 1, 3, 1])
-        for col, title in zip(hc_leg, ["Дата", "Наименование", "Тип", "Факт", "Комментарий", "Действие"]):
-            col.write(f"**{title}**")
-        st.divider()
+        st.write(f"**Последние {len(df_legal)} подтвержденных операций:**")
         
-        # Отрисовываем каждую запись
-        for _, row in df_legal.iterrows():
-            c = st.columns([2, 3, 2, 1, 3, 1])
+        for idx, row in df_legal.iterrows():
+            # Меняем сетку на 6 колонок
+            c = st.columns([2, 2, 4, 2, 1, 1])
             
-            c[0].caption(row['resolved_at'] or row['detected_at'])
-            c[1].write(row['item_name'])
+            # 1. Дата
+            c[0].caption(row['detected_at'][:16])
             
-            is_bug = "[BUG]" in str(row['comment'])
+            # 2. Артикул
+            sku_text = row['sku'] if pd.notna(row['sku']) and row['sku'] else "Без артикула"
+            c[1].write(f"🏷️ {sku_text}")
             
-            # Цветовое кодирование: Приходы делаем нейтрально-серыми, Сверки - зелеными, Баги - красными
-            # Цветовое кодирование
-            if is_bug:
-                c[2].write(f"🔴 :red[{row['anomaly_type']}]")
-            elif row['anomaly_type'] == 'Успешная сверка':
-                c[2].write(f"🟢 :green[{row['anomaly_type']}]")
-            elif row['anomaly_type'] == '⏳ Догруз с сайта':
-                c[2].write(f"🟡 :orange[{row['anomaly_type']}]") # Подсвечиваем задержку
-            else:
-                c[2].write(f"⚪ :gray[{row['anomaly_type']}]")
+            # 3. Название товара и комментарий (если есть)
+            c[2].write(row['item_name'])
+            if row['comment']:
+                c[2].caption(f"💬 {row['comment']}")
                 
-            c[3].write(row['qty_physical'])
-            c[4].caption(str(row['comment']) if pd.notna(row['comment']) else "")
+            # 4. Статус и количество
+            delta_val = int(row['delta']) if pd.notna(row['delta']) else 0
+            delta_text = f"+{delta_val} шт." if delta_val > 0 else f"{delta_val} шт."
             
-            # Встраиваем кнопку "Баг" (Точно так же, как в верхней таблице)
-            if is_bug:
-                c[5].button("✅", key=f"leg_bug_done_{row['id']}", disabled=True, help="Уже отмечено как баг")
-            else:
-                if c[5].button("🚨 Баг", key=f"leg_mark_bug_{row['id']}", help="Пометить как сбой интерфейса/системы"):
-                    with get_connection() as conn:
-                        conn.execute("""
-                            UPDATE anomaly_log 
-                            SET comment = '[BUG] ' || IFNULL(comment, 'Ошибка классификации/UI') 
-                            WHERE id = ?
-                        """, (row['id'],))
-                        conn.commit()
-                    st.rerun() # Мгновенно обновляем интерфейс и перекрашиваем графики
+            if row['anomaly_type'] == 'Успешная сверка':
+                c[3].write(f"🟢 :green[{row['anomaly_type']}]")
+            elif row['anomaly_type'] == '⏳ Догруз с сайта':
+                c[3].write(f"🟡 :orange[{row['anomaly_type']}] **{delta_text}**")
+            elif row['anomaly_type'] == '🔄 Обновление карточки':
+                c[3].write(f"🟣 :violet[{row['anomaly_type']}] **{delta_text}**")
+            else: # 📦 Плановый приход
+                c[3].write(f"⚪ :gray[{row['anomaly_type']}] **{delta_text}**")
+                
+            # 5. КНОПКА БАГА
+            if c[4].button("🚨", key=f"leg_bug_{row['id']}", help="Ошибся кнопкой? Отправить в баги"):
+                with get_connection() as conn:
+                    conn.execute("""
+                        UPDATE anomaly_log 
+                        SET comment = '[BUG] ' || IFNULL(comment, 'Ошибочная легализация') 
+                        WHERE id = ?
+                    """, (row['id'],))
+                    conn.commit()
+                st.rerun()
+            
+            # --- НОВАЯ КНОПКА ВОЗВРАТА В АНОМАЛИИ ---
+            if c[5].button("↩️", key=f"restore_leg_{row['id']}", help="Отменить решение и вернуть в Аномалии"):
+                # 1. Удаляем из базы (Очищаем KPI)
+                with get_connection() as conn:
+                    conn.execute("DELETE FROM anomaly_log WHERE id = ?", (row['id'],))
+                    conn.commit()
+                # 2. Возвращаем на экран Аномалий
+                if row['item_name'] in st.session_state.dismissed_names:
+                    st.session_state.dismissed_names.remove(row['item_name'])
+                
+                st.toast(f"Товар возвращен во вкладку Аномалии!")
+                st.rerun()
+                
+            st.divider() # Рисует аккуратную линию между записями
 
 # 4. СТРАНИЦА НЕЛИКВИДОВ
 elif st.session_state.current_page == "❄️ Неликвиды":
@@ -1001,6 +1283,7 @@ elif st.session_state.current_page == "📈 Оборачиваемость":
         st.info("👈 Перейдите во вкладку '📦 Склад', найдите нужный товар через поиск и нажмите '📈 График'.")
     else:
         target_name = st.session_state.selected_item_name
+        target_sku = st.session_state.get('selected_item_sku', '')
         
         if st.button("🔙 Вернуться на склад", use_container_width=False):
             st.session_state.current_page = "📦 Склад"
@@ -1008,7 +1291,7 @@ elif st.session_state.current_page == "📈 Оборачиваемость":
             
         st.subheader(f"{target_name}")
         
-        history = load_velocity_history(target_name)
+        history = load_velocity_history(target_name, target_sku)
         
         if len(history) < 2: 
             st.warning("Мало данных для годового графика. Нужно накопить хотя бы 2 среза базы.")
@@ -1080,19 +1363,31 @@ elif st.session_state.current_page == "🔥 Задачи":
                 
                 # 3. Финальное решение
                 st.write("---")
+                
+                # Выбор причины закрытия, чтобы не портить MTTR склада
+                close_reason = st.radio(
+                    "Что это было?", 
+                    ["Обычное расхождение (ошибка склада/1С)", "Просто лаг сайта (Догруз данных)"],
+                    key=f"reason_{row['id']}"
+                )
+                
                 final_note = st.text_input("Заметка при закрытии (опционально):", 
                                           placeholder="Напр: Данные в 1С обновлены, остаток корректен",
                                           key=f"note_{row['id']}")
                 
                 bc1, bc2 = st.columns(2)
-                if bc1.button("✅ Вопрос решен (в 🎯 Эффективность)", key=f"close_{row['id']}", use_container_width=True):
-                    # Используем готовую функцию-обертку, которую мы создали ранее!
+                if bc1.button("✅ Вопрос решен", key=f"close_{row['id']}", type="primary", use_container_width=True):
+                    
+                    # Если это вина сайта, принудительно меняем тип аномалии
+                    # Это исключит задачу из расчета MTTR
+                    if close_reason == "Просто лаг сайта (Догруз данных)":
+                        with get_connection() as conn:
+                            conn.execute("UPDATE anomaly_log SET anomaly_type = '⏳ Догруз с сайта' WHERE id = ?", (row['id'],))
+                            conn.commit()
+                            
                     close_anomaly_in_db(row['id'], final_note)
                     st.rerun()
                 
                 if bc2.button("🗑️ Отменить запись", key=f"cancel_{row['id']}", use_container_width=True):
-                     # Передаем текст из поля final_note при отмене
                     cancel_anomaly_in_db(row['id'], final_note) 
                     st.rerun()
-                
-                st.caption(f"📅 Дата: {row['detected_at']} | Тип: {row['anomaly_type']}")
