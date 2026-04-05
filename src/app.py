@@ -48,6 +48,16 @@ if 'dismissed_names' not in st.session_state:
             with sqlite3.connect(DB_PATH) as conn:
                 # Создаем таблицу для хранения связей старых и новых имен
                 conn.execute("CREATE TABLE IF NOT EXISTS item_aliases (new_name TEXT, old_name TEXT)")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS expected_deliveries (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        item_name TEXT,
+                        sku TEXT,
+                        qty_expected INTEGER,
+                        status TEXT DEFAULT 'Ожидает'
+                    )
+                """)
                 conn.commit()
                 res = conn.execute("SELECT DISTINCT item_name FROM anomaly_log WHERE detected_at >= datetime('now', '-1 day', 'localtime')").fetchall()
                 st.session_state.dismissed_names = [r[0] for r in res]
@@ -312,7 +322,7 @@ with st.sidebar:
 
     # --- ЛОГИЧЕСКОЕ РАЗДЕЛЕНИЕ МЕНЮ: ОПЕРАЦИИ ---
     st.caption("🛠 ОПЕРАЦИИ")
-    op_options = ["📦 Склад", f"⚠️ Аномалии ({active_anom_count})", f"🔥 Задачи ({open_tasks_count})"]
+    op_options = ["📦 Склад", f"⚠️ Аномалии ({active_anom_count})", f"🔥 Задачи ({open_tasks_count})", "📥 Приемка"]
     
     op_idx = next((i for i, opt in enumerate(op_options) if opt.startswith(base_page)), None)
     st.radio("Рабочая область", op_options, index=op_idx, key="op_nav", on_change=nav_changed, args=("op",))
@@ -1390,4 +1400,88 @@ elif st.session_state.current_page == "🔥 Задачи":
                 
                 if bc2.button("🗑️ Отменить запись", key=f"cancel_{row['id']}", use_container_width=True):
                     cancel_anomaly_in_db(row['id'], final_note) 
+                    st.rerun()
+
+elif st.session_state.current_page == "📥 Приемка":
+    st.subheader("📸 Оцифровка накладной (Нейро-приемка)")
+    st.caption("Сфотографируйте таблицу с товарами. Цены и контрагентов в кадр брать не нужно.")
+    
+    import google.generativeai as genai
+    from PIL import Image
+    import json
+    
+    api_key = st.secrets["GEMINI_API_KEY"]
+    
+    if api_key:
+        genai.configure(api_key=api_key)
+        
+        # Виджеты загрузки
+        cam_photo = st.camera_input("📸 Сделать снимок накладной")
+        file_photo = st.file_uploader("📂 Или выберите фото из галереи:", type=["jpg", "jpeg", "png"])
+        
+        photo = cam_photo if cam_photo else file_photo
+        
+        if photo:
+            st.image(photo, caption="📸 Готово к распознаванию", width=400)
+            
+            if st.button("🚀 Отправить в Gemini на оцифровку", type="primary", use_container_width=True):
+                with st.spinner("🧠 Нейросеть читает таблицу (это займет 3-5 секунд)..."):
+                    try:
+                        img = Image.open(photo)
+                        
+                        # Используем легкую и быструю модель Flash
+                        model = genai.GenerativeModel('gemini-1.5-flash')
+                        
+                        # Строгий промпт для нейросети
+                        prompt = """
+                        Ты — складской алгоритм оцифровки. 
+                        На этой картинке таблица с товарами (накладная). 
+                        Твоя задача — извлечь Название, Артикул (если есть, иначе пусто) и Количество.
+                        Исправляй опечатки OCR (например, если 'Кран 1/Z', пиши 'Кран 1/2').
+                        ВЕРНИ СТРОГО МАССИВ JSON И БОЛЬШЕ НИЧЕГО. 
+                        Формат:
+                        [
+                          {"название": "Кран...", "артикул": "12345", "количество": 10},
+                          {"название": "Гайка...", "артикул": "", "количество": 50}
+                        ]
+                        """
+                        
+                        response = model.generate_content([prompt, img])
+                        
+                        # Очистка JSON от мусора
+                        raw_text = response.text.replace("```json", "").replace("```", "").strip()
+                        items_list = json.loads(raw_text)
+                        
+                        st.success(f"✅ Распознано позиций: {len(items_list)}")
+                        st.session_state.temp_invoice = items_list
+                        
+                    except Exception as e:
+                        st.error(f"❌ Ошибка распознавания: {e}")
+                        st.info("Проверьте API-ключ или попробуйте сфотографировать ровнее.")
+            
+            # Если данные распознаны, показываем их и даем кнопку сохранения
+            if 'temp_invoice' in st.session_state:
+                st.write("---")
+                st.write("**Результат оцифровки:**")
+                df_result = pd.DataFrame(st.session_state.temp_invoice)
+                
+                st.dataframe(df_result, use_container_width=True, hide_index=True)
+                
+                if st.button("💾 Подтвердить и сохранить в Ожидаемые приходы", type="primary"):
+                    with get_connection() as conn:
+                        for item in st.session_state.temp_invoice:
+                            # Защита от кривых данных: переводим кол-во в число
+                            try:
+                                qty = int(item.get('количество', 0))
+                            except ValueError:
+                                qty = 0
+                                
+                            conn.execute("""
+                                INSERT INTO expected_deliveries (item_name, sku, qty_expected) 
+                                VALUES (?, ?, ?)
+                            """, (str(item.get('название', '')), str(item.get('артикул', '')), qty))
+                        conn.commit()
+                    
+                    del st.session_state.temp_invoice
+                    st.success("🎉 Накладная сохранена в систему! Товар ожидает поступления.")
                     st.rerun()

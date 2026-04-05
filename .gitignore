@@ -32,3 +32,5 @@ data/*
 *.sqlite-shm
 *.sqlite-wal
 crawler_state.json
+
+.streamlit/
