@@ -601,6 +601,48 @@ if st.session_state.current_page == "📦 Склад":
 # 2. СТРАНИЦА АНОМАЛИЙ
 elif st.session_state.current_page == "⚠️ Аномалии":
     active_anom = df_anomalies[~df_anomalies['Наименование'].isin(st.session_state.dismissed_names)] if not df_anomalies.empty else pd.DataFrame()
+
+    if not active_anom.empty:
+        # Берем только приходы (Дельта > 0)
+        arrivals = active_anom[active_anom['Дельта'] > 0]
+        
+        if not arrivals.empty:
+            with get_connection() as conn:
+                # Загружаем ожидаемые приходы
+                expected = pd.read_sql_query("SELECT * FROM expected_deliveries WHERE status = 'Ожидает'", conn)
+                
+                if not expected.empty:
+                    for idx, anom_row in arrivals.iterrows():
+                        # Ищем совпадение по имени ИЛИ артикулу И количеству
+                        match = expected[
+                            ((expected['item_name'] == anom_row['Наименование']) | (expected['sku'] == anom_row['Артикул'])) & 
+                            (expected['qty_expected'] == anom_row['Дельта'])
+                        ]
+                        
+                        if not match.empty:
+                            match_id = match.iloc[0]['id']
+                            
+                            # Нашли! Сами легализуем аномалию
+                            save_anomaly_to_db({
+                                "item_name": anom_row['Наименование'],
+                                "anomaly_type": "📦 Плановый приход",
+                                "qty_system": anom_row['Стало'],
+                                "qty_physical": anom_row['Было'], 
+                                "financial_impact": 0,
+                                "source": "Автоматически (Нейро-приемка)",
+                                "status": "Закрыта", 
+                                "comment": f"Авто-матчинг с накладной #{match_id}"
+                            })
+                            
+                            # Помечаем в буфере, что этот товар принят
+                            conn.execute("UPDATE expected_deliveries SET status = 'Принято' WHERE id = ?", (int(match_id),))
+                            conn.commit()
+                            
+                            # Скрываем с экрана
+                            st.session_state.dismissed_names.append(anom_row['Наименование'])
+                            st.toast(f"🤖 Авто-приемка: {anom_row['Наименование']}")
+                            st.rerun()
+
     if active_anom.empty: 
         st.success("Аномалий нет.")
     else:
@@ -1404,51 +1446,57 @@ elif st.session_state.current_page == "🔥 Задачи":
 
 elif st.session_state.current_page == "📥 Приемка":
     st.subheader("📸 Оцифровка накладной (Нейро-приемка)")
-    st.caption("Сфотографируйте таблицу с товарами. Цены и контрагентов в кадр брать не нужно.")
+    st.caption("Загрузите фото таблицы с товарами. Цены и контрагентов в кадр брать не нужно.")
     
-    import google.generativeai as genai
+    # Используем новый SDK google-genai
+    from google import genai 
     from PIL import Image
     import json
     
     api_key = st.secrets["GEMINI_API_KEY"]
     
     if api_key:
-        genai.configure(api_key=api_key)
+        # Инициализируем нового клиента (стандарт 2026 года)
+        client = genai.Client(api_key=api_key)
         
-        # Виджеты загрузки
-        cam_photo = st.camera_input("📸 Сделать снимок накладной")
-        file_photo = st.file_uploader("📂 Или выберите фото из галереи:", type=["jpg", "jpeg", "png"])
+        # Оставляем только загрузку из галереи по твоей просьбе
+        file_photo = st.file_uploader("📂 Выберите фото из галереи (накладная):", type=["jpg", "jpeg", "png"])
         
-        photo = cam_photo if cam_photo else file_photo
-        
-        if photo:
-            st.image(photo, caption="📸 Готово к распознаванию", width=400)
+        if file_photo:
+            st.image(file_photo, caption="📸 Фото загружено", width=400)
             
-            if st.button("🚀 Отправить в Gemini на оцифровку", type="primary", use_container_width=True):
-                with st.spinner("🧠 Нейросеть читает таблицу (это займет 3-5 секунд)..."):
+            if st.button("🚀 Отправить в Gemini 3.1 на оцифровку", type="primary", use_container_width=True):
+                with st.spinner("🧠 Нейросеть Gemini 3.1 Flash Lite читает таблицу..."):
                     try:
-                        img = Image.open(photo)
+                        img = Image.open(file_photo)
                         
-                        # Используем легкую и быструю модель Flash
-                        model = genai.GenerativeModel('gemini-1.5-flash')
-                        
-                        # Строгий промпт для нейросети
+                        # Строгий промпт
                         prompt = """
-                        Ты — складской алгоритм оцифровки. 
+                        Ты — точный алгоритм оцифровки документов. 
                         На этой картинке таблица с товарами (накладная). 
-                        Твоя задача — извлечь Название, Артикул (если есть, иначе пусто) и Количество.
-                        Исправляй опечатки OCR (например, если 'Кран 1/Z', пиши 'Кран 1/2').
+                        
+                        ТВОЯ ЗАДАЧА:
+                        Извлечь данные из ячеек "Артикул", "Товары" и "Кол-во" СТРОГО 1 в 1 как напечатано на бумаге.
+                        
+                        ПРАВИЛА:
+                        1. Название: Перепиши весь текст ячейки полностью. Обязательно сохраняй все скобки, размеры и приписки (например, "(L=53мм) - рычаг (10/100шт.)"). Ничего не сокращай!
+                        2. Артикул: Перепиши всё содержимое ячейки. Если там есть название бренда (например, "Джакомини Рус") или перенос строки, склей это в одну строку и сохрани. Не обрезай текст!
+                        3. Количество: Верни только цифру.
+                        
                         ВЕРНИ СТРОГО МАССИВ JSON И БОЛЬШЕ НИЧЕГО. 
                         Формат:
                         [
-                          {"название": "Кран...", "артикул": "12345", "количество": 10},
-                          {"название": "Гайка...", "артикул": "", "количество": 50}
+                          {"название": "Кран шаровый латунный... (L=53мм) - рычаг...", "артикул": "R850X023 Джакомини Рус", "количество": 100}
                         ]
                         """
                         
-                        response = model.generate_content([prompt, img])
+                        # Вызов через новый SDK и модель 3.1 Flash Lite
+                        response = client.models.generate_content(
+                            model="gemini-3.1-flash-lite-preview",
+                            contents=[prompt, img]
+                        )
                         
-                        # Очистка JSON от мусора
+                        # Очистка текста от маркдауна и парсинг
                         raw_text = response.text.replace("```json", "").replace("```", "").strip()
                         items_list = json.loads(raw_text)
                         
@@ -1457,9 +1505,9 @@ elif st.session_state.current_page == "📥 Приемка":
                         
                     except Exception as e:
                         st.error(f"❌ Ошибка распознавания: {e}")
-                        st.info("Проверьте API-ключ или попробуйте сфотографировать ровнее.")
+                        st.info("💡 Убедитесь, что Bitvise SSH (прокси) залогинен и работает на ноутбуке.")
             
-            # Если данные распознаны, показываем их и даем кнопку сохранения
+            # Блок сохранения результата
             if 'temp_invoice' in st.session_state:
                 st.write("---")
                 st.write("**Результат оцифровки:**")
@@ -1470,10 +1518,9 @@ elif st.session_state.current_page == "📥 Приемка":
                 if st.button("💾 Подтвердить и сохранить в Ожидаемые приходы", type="primary"):
                     with get_connection() as conn:
                         for item in st.session_state.temp_invoice:
-                            # Защита от кривых данных: переводим кол-во в число
                             try:
                                 qty = int(item.get('количество', 0))
-                            except ValueError:
+                            except (ValueError, TypeError):
                                 qty = 0
                                 
                             conn.execute("""
@@ -1483,5 +1530,52 @@ elif st.session_state.current_page == "📥 Приемка":
                         conn.commit()
                     
                     del st.session_state.temp_invoice
-                    st.success("🎉 Накладная сохранена в систему! Товар ожидает поступления.")
+                    st.success("🎉 Данные успешно добавлены в список ожидания!")
                     st.rerun()
+            
+    st.divider()
+    st.subheader("📋 Список ожидаемых товаров")
+    st.caption("Эти позиции были оцифрованы и ждут появления на сайте для авто-легализации аномалий.")
+    
+    with get_connection() as conn:
+        # Вытаскиваем только те товары, которые еще не были легализованы
+        expected_df = pd.read_sql_query(
+            "SELECT id, created_at, sku, item_name, qty_expected FROM expected_deliveries WHERE status = 'Ожидает' ORDER BY created_at DESC", 
+            conn
+        )
+        
+    if expected_df.empty:
+        st.info("В листе ожидания пока ничего нет.")
+    else:
+        # Рисуем шапку таблицы
+        hc = st.columns([2, 2, 4, 2, 1])
+        for col, title in zip(hc, ["Дата сканирования", "Артикул", "Наименование", "Ожидаем", "Действие"]):
+            col.write(f"**{title}**")
+        st.divider()
+        
+        # Построчный вывод каждого ожидаемого товара
+        for _, row in expected_df.iterrows():
+            c = st.columns([2, 2, 4, 2, 1])
+            
+            # 1. Дата (обрезаем до минут для красоты)
+            c[0].caption(str(row['created_at'])[:16])
+            
+            # 2. Артикул
+            sku_text = row['sku'] if pd.notna(row['sku']) and row['sku'] else "—"
+            c[1].write(sku_text)
+            
+            # 3. Название
+            c[2].write(row['item_name'])
+            
+            # 4. Количество
+            c[3].write(f"{row['qty_expected']} шт.")
+            
+            # 5. Кнопка удаления (полностью удаляет строку из БД)
+            if c[4].button("❌", key=f"del_exp_{row['id']}", help="Удалить позицию из листа ожидания"):
+                with get_connection() as conn:
+                    conn.execute("DELETE FROM expected_deliveries WHERE id = ?", (row['id'],))
+                    conn.commit()
+                st.toast(f"🗑️ Товар удален из ожидания: {row['item_name']}")
+                st.rerun()
+            
+            st.divider()
