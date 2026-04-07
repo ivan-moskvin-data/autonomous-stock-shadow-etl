@@ -34,3 +34,4 @@ data/*
 crawler_state.json
 
 .streamlit/
+_workspace

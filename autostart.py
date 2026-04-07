@@ -12,6 +12,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 LAST_RUN_FILE = BASE_DIR / "logs" / "last_run.date"
 PARSER_SCRIPT = BASE_DIR / "src" / "parser.py"
+FORECASTER_SCRIPT = BASE_DIR / "src" / "ai_forecaster.py"
 
 if sys.platform == "win32":
     VENV_PYTHON = BASE_DIR / "venv" / "Scripts" / "python.exe"
@@ -91,6 +92,16 @@ def main() -> None:
             if result.returncode == 0:
                 mark_as_run()
                 print("✅ Парсинг успешно завершен. Отметка установлена.")
+                
+                # --- НОВЫЙ БЛОК: Запуск ИИ после парсера ---
+                print("🧠 Запускаем фоновый AI-анализ закупок (Shadow Mode)...")
+                try:
+                    subprocess.run([str(VENV_PYTHON), str(FORECASTER_SCRIPT)], check=True)
+                    print("✅ AI-прогнозы успешно сгенерированы.")
+                except subprocess.CalledProcessError as e:
+                    print(f"❌ Ошибка во время работы AI-прогнозиста. Код выхода: {e.returncode}.")
+                # -------------------------------------------
+                
         except subprocess.CalledProcessError as e:
             print(f"❌ Ошибка во время работы парсера. Код выхода: {e.returncode}. Отметка не поставлена.")
             time.sleep(10)

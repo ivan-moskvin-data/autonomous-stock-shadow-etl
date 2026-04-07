@@ -31,6 +31,60 @@ def color_rows(row):
     
     return [colors.get(anomaly_type, '')] * len(row)
 
+def verify_shadow_forecasts():
+    """Шаг 3: Проверка старых прогнозов (Shadow Mode)"""
+    with get_connection() as conn:
+        forecasts = pd.read_sql_query("SELECT * FROM ai_forecasts WHERE status = '⏳ Наблюдение'", conn)
+        if forecasts.empty: return
+        
+        latest_inv = load_inventory()
+        if latest_inv.empty: return
+        
+        today = pd.Timestamp.now().normalize()
+        
+        for _, row in forecasts.iterrows():
+            item = row['item_name']
+            
+            # Безопасный поиск товара
+            match = latest_inv[latest_inv['Наименование'] == item]
+            if match.empty: continue
+            
+            curr_qty = match.iloc[0]['Остаток']
+            price = match.iloc[0]['Цена']
+            pred_date = pd.Timestamp(row['predicted_zero_date'])
+            avg_sales = row['avg_daily_sales']
+            
+            # Логика 1: Упущенная выгода (Товар кончился в 0, а дата ИИ наступила)
+            if curr_qty == 0 and today >= pred_date:
+                days_lost = max(1, (today - pred_date).days)
+                lost_value = days_lost * avg_sales * price
+                conn.execute("UPDATE ai_forecasts SET status = '📉 Упущенная выгода', lost_sales_value = ? WHERE id = ?", (lost_value, row['id']))
+                
+            # Логика 2: Замороженный капитал (Менеджер купил слишком много, запас > 60 дней)
+            elif curr_qty > (avg_sales * 60):
+                
+                # --- ЗАЩИТА ОТ ДВОЙНОГО УЧЕТА ---
+                # Проверяем, не штрафовали ли мы уже этот товар за перезатарку в последние 30 дней
+                recent_penalty = conn.execute("""
+                    SELECT 1 FROM ai_forecasts 
+                    WHERE item_name = ? AND status = '🧊 Перезатарка' AND created_at >= date('now', '-30 days', 'localtime')
+                """, (item,)).fetchone()
+                
+                if not recent_penalty:
+                    # Штрафуем в первый раз!
+                    overstock_qty = curr_qty - (avg_sales * 44)
+                    if overstock_qty > 0:
+                        overstock_value = overstock_qty * price
+                        conn.execute("UPDATE ai_forecasts SET status = '🧊 Перезатарка', overstock_value = ? WHERE id = ?", (overstock_value, row['id']))
+                else:
+                    # Товар уже оштрафован. Чтобы новый прогноз не висел бесконечно, просто "гасим" его
+                    conn.execute("UPDATE ai_forecasts SET status = '🔄 Пересчитан ИИ' WHERE id = ?", (row['id'],))
+    
+            # Логика 3: Идеальное попадание (Наступил день Х, и остаток реально близок к нулю - меньше 5 дней)
+            elif today >= pred_date and curr_qty <= (avg_sales * 5) and curr_qty > 0:
+                 conn.execute("UPDATE ai_forecasts SET status = '✅ Точный прогноз' WHERE id = ?", (row['id'],))
+        conn.commit()
+
 # --- НАСТРОЙКИ ПУТЕЙ ---
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "data" / "stock_history.sqlite"
@@ -56,6 +110,21 @@ if 'dismissed_names' not in st.session_state:
                         sku TEXT,
                         qty_expected INTEGER,
                         status TEXT DEFAULT 'Ожидает'
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS ai_forecasts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        item_name TEXT,
+                        sku TEXT,
+                        predicted_zero_date DATE,
+                        recommended_qty INTEGER,
+                        reason TEXT,
+                        avg_daily_sales REAL,
+                        status TEXT DEFAULT '⏳ Наблюдение', -- '⏳ Наблюдение', '📉 Упущенная выгода', '🧊 Перезатарка', '✅ Точный прогноз'
+                        lost_sales_value REAL DEFAULT 0,
+                        overstock_value REAL DEFAULT 0
                     )
                 """)
                 conn.commit()
@@ -331,7 +400,7 @@ with st.sidebar:
     
     # --- ЛОГИЧЕСКОЕ РАЗДЕЛЕНИЕ МЕНЮ: АНАЛИТИКА ---
     st.caption("📊 АНАЛИТИКА И KPI")
-    ana_options = ["🎯 Эффективность", "❄️ Неликвиды", "📈 Оборачиваемость"]
+    ana_options = ["🎯 Эффективность", "❄️ Неликвиды", "📈 Оборачиваемость", "⚖️ A/B Тест: AI vs Человек"]
     
     ana_idx = next((i for i, opt in enumerate(ana_options) if opt.startswith(base_page)), None)
     st.radio("Инструменты анализа", ana_options, index=ana_idx, key="ana_nav", on_change=nav_changed, args=("ana",))
@@ -1002,29 +1071,28 @@ elif st.session_state.current_page == "🎯 Эффективность":
         # Прячем тесты, если галочка не стоит
         iq_where = "" if include_tests else "WHERE anomaly_type != 'Тестовая запись'"
         
+        # 1. Выделяем ИИ в отдельную категорию по полю source!
         iq_query = f"""
             SELECT 
-                DATE(detected_at) as Day, -- Меняем месяц на конкретный день
+                DATE(detected_at) as Day, 
                 CASE 
                     WHEN IFNULL(comment, '') LIKE '%[BUG]%' THEN 'Failures'
-                    WHEN anomaly_type IN ('📦 Плановый приход', '⏳ Догруз с сайта', '🔄 Обновление карточки') THEN 'Automated'
+                    WHEN source = 'Автоматически (Нейро-приемка)' THEN '✨ AI Auto-Receive'
+                    WHEN anomaly_type IN ('📦 Плановый приход', '⏳ Догруз с сайта', '🔄 Обновление карточки') THEN 'Routine (Manual)'
                     WHEN anomaly_type IN ('Системная ошибка') THEN 'Failures'
                     WHEN anomaly_type IN ('Тестовая запись') THEN 'Debug'
-                    ELSE 'Signal'
+                    ELSE 'Signal (Anomalies)'
                 END as cat,
                 COUNT(*) as count
             FROM anomaly_log
             {iq_where}
             GROUP BY 1, 2
-            ORDER BY Day ASC -- Сортируем по дате для правильного графика
+            ORDER BY Day ASC 
         """
         df_iq = pd.read_sql_query(iq_query, conn)
     
     if not df_iq.empty:
-        # Список всех доступных категорий
         all_cats = sorted(df_iq['cat'].unique().tolist())
-        
-        # Виджет выбора категорий (по умолчанию выбраны все)
         selected_cats = st.multiselect(
             "🔎 Детализация System IQ (выберите категории для сравнения):", 
             options=all_cats, 
@@ -1032,55 +1100,53 @@ elif st.session_state.current_page == "🎯 Эффективность":
             key="iq_filter"
         )
         
-        # Фильтруем данные перед сводной таблицей
         df_iq_filtered = df_iq[df_iq['cat'].isin(selected_cats)]
         
         if not df_iq_filtered.empty:
             chart_iq = df_iq_filtered.pivot(index='Day', columns='cat', values='count').fillna(0)
             
+            # 2. Добавляем фиолетовый цвет для ИИ
             color_map_iq = {
-                'Automated': '#3498db', # Синий
-                'Debug': '#95a5a6',     # Серый
-                'Failures': '#e74c3c',  # Красный
-                'Signal': '#2ecc71'     # Зеленый
+                'Routine (Manual)': '#3498db', # Синий (рутина)
+                '✨ AI Auto-Receive': '#9b59b6', # Фиолетовый (работа ИИ)
+                'Debug': '#95a5a6',            # Серый
+                'Failures': '#e74c3c',         # Красный
+                'Signal (Anomalies)': '#2ecc71' # Зеленый
             }
             
-            # Подбираем цвета только для тех колонок, которые остались
             current_colors = [color_map_iq.get(col, '#000000') for col in chart_iq.columns]
             
             st.area_chart(chart_iq, color=current_colors) 
-            st.caption("🔵 **Automated:** Автоматизация | 🟢 **Signal:** Полезная работа | 🔴 **Failures:** Баги и сбои | ⚪ **Debug:** Тесты")
+            st.caption("🟣 **AI Auto-Receive:** Отработано нейросетью | 🔵 **Routine (Manual):** Ручные клики менеджера | 🟢 **Signal:** Аномалии")
         else:
             st.warning("Выберите хотя бы одну категорию для отображения графика.")
 
-    st.write("---") # Визуальный разделитель между графиками
+    st.write("---") 
 
     # --- РАЗДЕЛ 2: FEATURE ADOPTION (Дневная динамика UX) ---
-    st.subheader("🖱️ Feature Adoption (Daily UX)")
+    st.subheader("🖱️ Feature Adoption (Ручная нагрузка на менеджера)")
     with get_connection() as conn:
-        # Исключаем [BUG] и успешные сверки из статистики использования кнопок
-        ad_where = "WHERE anomaly_type != 'Успешная сверка' AND IFNULL(comment, '') NOT LIKE '%[BUG]%'"
+        # 3. ИСКЛЮЧАЕМ РАБОТУ ИИ ИЗ ЭТОГО ГРАФИКА (Здесь только ручные клики!)
+        ad_where = "WHERE anomaly_type != 'Успешная сверка' AND IFNULL(comment, '') NOT LIKE '%[BUG]%' AND source != 'Автоматически (Нейро-приемка)'"
         if not include_tests:
             ad_where += " AND anomaly_type NOT IN ('Тестовая запись')"
         
         adoption_ts_query = f"""
             SELECT 
-                DATE(detected_at) as Day, -- Заменили месяц на день
+                DATE(detected_at) as Day, 
                 anomaly_type,
                 COUNT(*) as count
             FROM anomaly_log
             {ad_where}
             GROUP BY 1, 2
-            ORDER BY Day ASC -- Сортировка для правильной временной шкалы
+            ORDER BY Day ASC 
         """
         df_adoption_ts = pd.read_sql_query(adoption_ts_query, conn)
     
     if not df_adoption_ts.empty:
-        # Список всех типов кнопок
         all_types = sorted(df_adoption_ts['anomaly_type'].unique().tolist())
-        
         selected_types = st.multiselect(
-            "🔎 Фильтр кнопок (отключите лишние, чтобы изменить масштаб):", 
+            "🔎 Динамика кликов (успех внедрения ИИ виден по падению кнопки 'Плановый приход'):", 
             options=all_types, 
             default=all_types,
             key="ad_filter"
@@ -1091,7 +1157,7 @@ elif st.session_state.current_page == "🎯 Эффективность":
         if not df_ad_filtered.empty:
             chart_adoption = df_ad_filtered.pivot(index='Day', columns='anomaly_type', values='count').fillna(0)
             st.area_chart(chart_adoption)
-            st.caption("График показывает интенсивность использования каждой кнопки классификации по дням.")
+            st.caption("График показывает, сколько раз человек физически нажимал кнопки классификации. Внедрение автоматизации снижает эти показатели.")
         else:
             st.warning("Выберите типы кнопок для отображения.")
     
@@ -1579,3 +1645,93 @@ elif st.session_state.current_page == "📥 Приемка":
                 st.rerun()
             
             st.divider()
+
+elif st.session_state.current_page == "⚖️ A/B Тест: AI vs Человек":
+    st.subheader("⚖️ A/B Тест: AI-прогноз vs Человеческие решения")
+    st.caption("Теневой режим работы: алгоритм делает прогнозы закупок и сверяет их с реальными действиями менеджеров. Это позволяет оценить упущенную выгоду без вмешательства в текущие бизнес-процессы.")
+    
+    # --- ИНДИКАТОР ПРОГРЕВА МОДЕЛИ (COLD START) ---
+    with get_connection() as conn:
+        # Считаем, сколько дней истории у нас есть
+        days_in_db_query = "SELECT COUNT(DISTINCT SUBSTR(report_timestamp, 1, 10)) FROM stocks"
+        days_in_db = conn.execute(days_in_db_query).fetchone()[0]
+        
+    if days_in_db < 30:
+        st.warning(f"⚠️ **Модель в стадии 'прогрева' (Cold Start):** Накоплено данных за {days_in_db} из 30 необходимых дней. До завершения сбора полной базы, ИИ экстраполирует короткие тренды, что может приводить к повышенной погрешности (ложным срабатываниям Перезатарки).")
+    else:
+        st.success(f"✅ **Модель обучена:** Накоплено данных за {days_in_db} дней. Точность прогнозов оптимальна.")
+
+    # 1. Запускаем фоновую проверку прогнозов при входе на вкладку
+    verify_shadow_forecasts()
+    
+    with get_connection() as conn:
+        df_forecasts = pd.read_sql_query("SELECT * FROM ai_forecasts ORDER BY created_at DESC", conn)
+        
+    if df_forecasts.empty:
+        st.info("Пока нет активных прогнозов. Сгенерируйте их с помощью кнопки ниже.")
+    else:
+        # 2. Считаем продуктовые метрики (Shadow ROI)
+        total_lost = df_forecasts['lost_sales_value'].sum()
+        total_overstock = df_forecasts['overstock_value'].sum()
+        
+        m1, m2 = st.columns(2)
+        m1.metric("📉 Упущенная выгода (Prevented Lost Sales)", f"{total_lost:,.0f} ₽".replace(',', ' '), help="Сколько компания потеряла из-за того, что товар кончился, а закупка не была сделана вовремя.")
+        m2.metric("🧊 Замороженный капитал (Cost of Overstock)", f"{total_overstock:,.0f} ₽".replace(',', ' '), help="Сумма излишков, купленных сверх рекомендаций ИИ.")
+        
+        st.write("---")
+        st.write("**Детализация (Журнал прогнозов и финансовых последствий):**")
+        
+        # Берем нужные колонки
+        display_df = df_forecasts[['created_at', 'item_name', 'predicted_zero_date', 'recommended_qty', 'reason', 'status', 'lost_sales_value', 'overstock_value']].copy()
+        
+        # РАЗДЕЛЯЕМ ПОНЯТИЯ: Упущенная выручка (чистый убыток) и Замороженный капитал
+        display_df['Упущенная выручка (₽)'] = display_df['lost_sales_value'].apply(lambda x: f"{x:,.0f} ₽".replace(',', ' ') if x > 0 else "")
+        display_df['Заморожено (₽)'] = display_df['overstock_value'].apply(lambda x: f"{x:,.0f} ₽".replace(',', ' ') if x > 0 else "")
+        
+        display_df.rename(columns={
+            'created_at': 'Дата прогноза',
+            'item_name': 'Товар',
+            'predicted_zero_date': 'ИИ: Обнулится',
+            'recommended_qty': 'ИИ: Заказать (шт)',
+            'reason': 'Обоснование',
+            'status': 'Статус / Результат'
+        }, inplace=True)
+        
+        # Отрезаем секунды у даты
+        display_df['Дата прогноза'] = display_df['Дата прогноза'].str[:10]
+        
+        # Отрисовываем таблицу, убрав сырые технические колонки с нулями
+        st.dataframe(
+            display_df.drop(columns=['lost_sales_value', 'overstock_value']), 
+            use_container_width=True, 
+            hide_index=True
+        )
+
+    st.divider()
+    
+    # 3. Кнопка запуска
+    if st.button("🚀 Запустить полный анализ закупок (Batch Mode)", type="primary"):
+        with st.spinner("🤖 ИИ анализирует графики продаж..."):
+            try:
+                from ai_forecaster import run_batch_forecast
+                status = run_batch_forecast()
+                
+                if status == "no_key":
+                    st.error("❌ Не найден API ключ Gemini в файле secrets.toml!")
+                elif status == "empty":
+                    st.warning("⚠️ Не найдено товаров с падающим остатком. Прогнозировать пока нечего.")
+                elif status and status.startswith("error_"):
+                    # НОВЫЙ БЛОК: Выводим реальную причину сбоя ИИ
+                    err_text = status.split('_', 1)[1]
+                    st.error(f"❌ Сбой при запросе к нейросети: {err_text}")
+                elif status and status.startswith("ok_"):
+                    count = status.split('_')[1]
+                    if count == "0":
+                         st.warning("⚠️ Запрос прошел, но нейросеть не смогла сформировать прогноз (вернула пустоту).")
+                    else:
+                         st.success(f"✅ Анализ завершен! Сгенерировано прогнозов: {count}. Они добавлены в таблицу.")
+                else:
+                    st.error("❌ Произошел внутренний сбой.")
+                    
+            except Exception as e:
+                st.error(f"❌ Критическая ошибка: {e}")
