@@ -13,6 +13,7 @@ CONFIG_PATH = BASE_DIR / "config.json"
 LAST_RUN_FILE = BASE_DIR / "logs" / "last_run.date"
 PARSER_SCRIPT = BASE_DIR / "src" / "parser.py"
 FORECASTER_SCRIPT = BASE_DIR / "src" / "ai_forecaster.py"
+AI_PENDING_FILE = BASE_DIR / "logs" / "ai_pending.flag"
 
 if sys.platform == "win32":
     VENV_PYTHON = BASE_DIR / "venv" / "Scripts" / "python.exe"
@@ -93,14 +94,16 @@ def main() -> None:
                 mark_as_run()
                 print("✅ Парсинг успешно завершен. Отметка установлена.")
                 
+                # --- СОЗДАЕМ ФЛАГ ДОЛГА (PENDING JOB) ---
+                AI_PENDING_FILE.touch(exist_ok=True)
+                
                 # --- НОВЫЙ БЛОК: Запуск ИИ после парсера ---
                 print("🧠 Запускаем фоновый AI-анализ закупок (Shadow Mode)...")
                 try:
                     subprocess.run([str(VENV_PYTHON), str(FORECASTER_SCRIPT)], check=True)
-                    print("✅ AI-прогнозы успешно сгенерированы.")
+                    print("✅ AI-скрипт отработал (проверьте логи на предмет ошибок ИИ).")
                 except subprocess.CalledProcessError as e:
                     print(f"❌ Ошибка во время работы AI-прогнозиста. Код выхода: {e.returncode}.")
-                # -------------------------------------------
                 
         except subprocess.CalledProcessError as e:
             print(f"❌ Ошибка во время работы парсера. Код выхода: {e.returncode}. Отметка не поставлена.")

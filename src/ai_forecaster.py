@@ -118,4 +118,12 @@ def run_batch_forecast():
         return f"ok_{success_count}"
 
 if __name__ == "__main__":
-    run_batch_forecast()
+    status = run_batch_forecast()
+    logging.info(f"Статус выполнения ИИ: {status}")
+    
+    # Если ИИ отработал успешно или прогнозировать пока нечего - списываем долг
+    if status == "empty" or (isinstance(status, str) and status.startswith("ok_")):
+        flag_path = BASE_DIR / "logs" / "ai_pending.flag"
+        if flag_path.exists():
+            flag_path.unlink()
+            logging.info("✅ Флаг ожидания ИИ успешно снят.")
