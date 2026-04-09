@@ -481,7 +481,7 @@ if st.session_state.current_page == "📦 Склад":
         if not is_proxy_ok:
             st.error("🚨 **Системное предупреждение:** Парсер собрал новые данные, но ИИ-прогнозы не построены (нет связи с Gemini API). **Пожалуйста, включите VPN/Прокси!**")
         else:
-            st.warning("⚠️ **ИИ ожидает запуска:** Прокси работает, в системе есть свежие не проанализированные данные. Перейдите на вкладку '⚖️ A/B Тест' и нажмите кнопку запуска.")
+            st.warning("⚠️ **ИИ ожидает запуска:** В системе есть свежие не проанализированные данные. Включите прокси, перейдите на вкладку '⚖️ A/B Тест' и нажмите кнопку запуска.")
 
     st.write("---")
     
@@ -1745,58 +1745,46 @@ elif st.session_state.current_page == "⚖️ A/B Тест: AI vs Человек
         )
 
     st.divider()
-
-    st.write("**Управление ИИ-аналитикой:**")
     
     pending_flag = Path("logs/ai_pending.flag")
     
-    # 1. Узнаем, генерировал ли ИИ что-то сегодня
+    # 1. Считаем прогнозы за сегодня для понимания статуса
     with sqlite3.connect(DB_PATH) as conn:
          forecasts_today = conn.execute("SELECT COUNT(*) FROM ai_forecasts WHERE date(created_at) = date('now', 'localtime')").fetchone()[0]
 
-    # 2. Логика: проверяем прокси ТОЛЬКО если висит долг, ИЛИ если за сегодня вообще не было прогнозов
-    if pending_flag.exists() or forecasts_today == 0:
-        is_proxy_ok = check_gemini_connection()
-        if not is_proxy_ok:
-            st.error("🚨 **Внимание:** Нет связи с серверами Google (Gemini API недоступен). Проверьте включен ли VPN/Прокси!")
-        else:
-            st.caption("🌐 Соединение с Gemini API: **Стабильно**")
-            
-        btn_disabled = not is_proxy_ok
-        btn_text = "🚀 Запустить полный анализ закупок"
+    # 2. Информационные уведомления
+    if pending_flag.exists():
+        st.warning("⚠️ **Есть необработанные данные:** Парсер собрал свежую информацию, но ИИ-анализ ещё не запущен. Нажмите кнопку ниже.")
+        btn_text = "🚀 Запустить анализ свежих данных"
         btn_type = "primary"
-    else:
-        # 3. Режим отдыха: долгов нет, прогнозы на сегодня уже есть
-        st.info("✅ **ИИ-анализ на сегодня завершен.** Новых данных от парсера не поступало. (Проверка прокси отключена)")
-        btn_disabled = False # Оставляем активной на случай, если захочешь принудительно пересчитать остатки
-        btn_text = "🔄 Принудительный перерасчет (без проверки прокси)"
+    elif forecasts_today > 0:
+        st.info(f"✅ **План на сегодня выполнен.** В базе уже есть {forecasts_today} прогнозов за текущие сутки.")
+        btn_text = "🔄 Принудительный пересчет"
         btn_type = "secondary"
+    else:
+        btn_text = "🚀 Запустить первичный анализ"
+        btn_type = "primary"
 
-    # --- САМА КНОПКА ЗАПУСКА ---
-    if st.button(btn_text, type=btn_type, disabled=btn_disabled, use_container_width=True):
+    # 3. Кнопка запуска (Всегда активна, чтобы пользователь мог сам проверить связь)
+    if st.button(btn_text, type=btn_type, use_container_width=True):
         with st.spinner("🤖 ИИ анализирует графики продаж..."):
             try:
                 from ai_forecaster import run_batch_forecast
                 status = run_batch_forecast()
                 
                 if status == "no_key":
-                    st.error("❌ Не найден API ключ Gemini в файле secrets.toml!")
+                    st.error("❌ Не найден API ключ Gemini!")
                 elif status == "empty":
-                    st.warning("⚠️ Не найдено товаров с падающим остатком. Прогнозировать пока нечего.")
-                    if pending_flag.exists(): pending_flag.unlink() # Списываем долг
+                    st.warning("⚠️ Не найдено товаров для анализа.")
+                    if pending_flag.exists(): pending_flag.unlink()
                 elif status and status.startswith("error_"):
+                    # Вот здесь пользователь увидит реальную ошибку прокси/связи, если она есть
                     err_text = status.split('_', 1)[1]
-                    st.error(f"❌ Сбой при запросе к нейросети: {err_text}")
+                    st.error(f"❌ Ошибка связи с ИИ: {err_text}")
                 elif status and status.startswith("ok_"):
                     count = status.split('_')[1]
-                    if count == "0":
-                         st.warning("⚠️ Запрос прошел, но нейросеть не смогла сформировать прогноз (вернула пустоту).")
-                    else:
-                         st.success(f"✅ Анализ завершен! Сгенерировано прогнозов: {count}.")
-                    if pending_flag.exists(): pending_flag.unlink() # Списываем долг
+                    st.success(f"✅ Готово! Сгенерировано прогнозов: {count}.")
+                    if pending_flag.exists(): pending_flag.unlink()
                          
-                # Сбрасываем кэш проверки прокси, чтобы при следующем рендере получить свежий статус
-                check_gemini_connection.clear()
-                
             except Exception as e:
                 st.error(f"❌ Критическая ошибка: {e}")

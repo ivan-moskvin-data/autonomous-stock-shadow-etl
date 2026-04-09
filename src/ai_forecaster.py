@@ -87,10 +87,35 @@ def run_batch_forecast():
             ]
             """
             
-            try:
-                res = client.models.generate_content(model="gemini-3.1-flash-lite-preview", contents=[prompt])
-                forecasts = json.loads(res.text.replace("```json", "").replace("```", "").strip())
+            # --- ВСТРОЕННАЯ ЗАЩИТА ОТ ОШИБКИ 503 (Экспоненциальная задержка) ---
+            MAX_RETRIES = 3
+            RETRY_DELAYS = [5, 15, 45]
+            forecasts = None
+            
+            for attempt in range(MAX_RETRIES):
+                try:
+                    res = client.models.generate_content(model="gemini-3.1-flash-lite-preview", contents=[prompt])
+                    forecasts = json.loads(res.text.replace("```json", "").replace("```", "").strip())
+                    break  # Успешно получили данные! Выходим из цикла повторов
                 
+                except Exception as e:
+                    err_msg = str(e)
+                    # Если Google перегружен (503) — ждем и пробуем снова
+                    if "503" in err_msg or "429" in err_msg or "UNAVAILABLE" in err_msg:
+                        if attempt < MAX_RETRIES - 1:
+                            wait_time = RETRY_DELAYS[attempt]
+                            logging.warning(f"⚠️ Google API перегружен. Ждем {wait_time} сек... (Попытка {attempt + 2}/{MAX_RETRIES})")
+                            time.sleep(wait_time)
+                        else:
+                            logging.error(f"❌ Сервер не ответил после {MAX_RETRIES} попыток.")
+                            return f"error_{err_msg}"
+                    # Если ошибка другая (например, ИИ вернул не JSON) — падаем сразу
+                    else:
+                        logging.error(f"❌ Ошибка пакета: {err_msg}")
+                        return f"error_{err_msg}"
+            
+            # Если данные успешно получены, записываем их в базу
+            if forecasts:
                 for f in forecasts:
                     avg_s = next((item['avg_sales'] for item in items_data if item['name'] == f['item_name']), 0)
                     
@@ -106,14 +131,10 @@ def run_batch_forecast():
                         INSERT INTO ai_forecasts (item_name, sku, predicted_zero_date, recommended_qty, reason, avg_daily_sales)
                         VALUES (?, ?, ?, ?, ?, ?)
                     """, (f['item_name'], f['sku'], f['predicted_zero_date'], f['recommended_qty'], f['reason'], avg_s))
+                
                 conn.commit()
                 success_count += len(forecasts)
                 time.sleep(6) 
-                
-            except Exception as e:
-                err_msg = str(e)
-                logging.error(f"❌ Ошибка пакета: {err_msg}")
-                return f"error_{err_msg}" # <--- ТЕПЕРЬ МЫ ВОЗВРАЩАЕМ ОШИБКУ!
                 
         return f"ok_{success_count}"
 
