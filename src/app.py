@@ -42,9 +42,10 @@ def color_rows(row):
     return [colors.get(anomaly_type, '')] * len(row)
 
 def verify_shadow_forecasts():
-    """Шаг 3: Проверка старых прогнозов (Shadow Mode)"""
+    """Шаг 3: Проверка старых прогнозов (Shadow Mode с динамическим счетчиком)"""
     with get_connection() as conn:
-        forecasts = pd.read_sql_query("SELECT * FROM ai_forecasts WHERE status = '⏳ Наблюдение'", conn)
+        # ТЕПЕРЬ мы проверяем и новые прогнозы, и те, по которым уже "капает" счетчик отсутствия
+        forecasts = pd.read_sql_query("SELECT * FROM ai_forecasts WHERE status IN ('⏳ Наблюдение', '🔴 Товар отсутствует')", conn)
         if forecasts.empty: return
         
         latest_inv = load_inventory()
@@ -54,6 +55,7 @@ def verify_shadow_forecasts():
         
         for _, row in forecasts.iterrows():
             item = row['item_name']
+            db_status = row['status']
             
             # Безопасный поиск товара
             match = latest_inv[latest_inv['Наименование'] == item]
@@ -64,35 +66,37 @@ def verify_shadow_forecasts():
             pred_date = pd.Timestamp(row['predicted_zero_date'])
             avg_sales = row['avg_daily_sales']
             
-            # Логика 1: Упущенная выгода (Товар кончился в 0, а дата ИИ наступила)
+            # ЛОГИКА 1: Товар обнулился (Включаем счетчик или продолжаем прибавлять дни)
             if curr_qty == 0 and today >= pred_date:
                 days_lost = max(1, (today - pred_date).days)
                 lost_value = days_lost * avg_sales * price
-                conn.execute("UPDATE ai_forecasts SET status = '📉 Упущенная выгода', lost_sales_value = ? WHERE id = ?", (lost_value, row['id']))
+                # Статус становится красным, убыток обновляется каждый день!
+                conn.execute("UPDATE ai_forecasts SET status = '🔴 Товар отсутствует', lost_sales_value = ? WHERE id = ?", (lost_value, row['id']))
                 
-            # Логика 2: Замороженный капитал (Менеджер купил слишком много, запас > 60 дней)
-            elif curr_qty > (avg_sales * 60):
+            # ЛОГИКА 2: Товар ПРИЕХАЛ после долгого отсутствия (Останавливаем счетчик)
+            elif curr_qty > 0 and db_status == '🔴 Товар отсутствует':
+                # Сумма убытка уже посчитана за прошлый день, просто фиксируем финальный статус
+                conn.execute("UPDATE ai_forecasts SET status = '📉 Упущенная выгода' WHERE id = ?", (row['id'],))
                 
-                # --- ЗАЩИТА ОТ ДВОЙНОГО УЧЕТА ---
-                # Проверяем, не штрафовали ли мы уже этот товар за перезатарку в последние 30 дней
+            # ЛОГИКА 3: Замороженный капитал (только для новых прогнозов)
+            elif curr_qty > (avg_sales * 60) and db_status == '⏳ Наблюдение':
                 recent_penalty = conn.execute("""
                     SELECT 1 FROM ai_forecasts 
                     WHERE item_name = ? AND status = '🧊 Перезатарка' AND created_at >= date('now', '-30 days', 'localtime')
                 """, (item,)).fetchone()
                 
                 if not recent_penalty:
-                    # Штрафуем в первый раз!
                     overstock_qty = curr_qty - (avg_sales * 44)
                     if overstock_qty > 0:
                         overstock_value = overstock_qty * price
                         conn.execute("UPDATE ai_forecasts SET status = '🧊 Перезатарка', overstock_value = ? WHERE id = ?", (overstock_value, row['id']))
                 else:
-                    # Товар уже оштрафован. Чтобы новый прогноз не висел бесконечно, просто "гасим" его
                     conn.execute("UPDATE ai_forecasts SET status = '🔄 Пересчитан ИИ' WHERE id = ?", (row['id'],))
-    
-            # Логика 3: Идеальное попадание (Наступил день Х, и остаток реально близок к нулю - меньше 5 дней)
-            elif today >= pred_date and curr_qty <= (avg_sales * 5) and curr_qty > 0:
+                
+            # ЛОГИКА 4: Идеальное попадание (Наступил день Х, остаток мал, но не ноль)
+            elif today >= pred_date and curr_qty <= (avg_sales * 5) and curr_qty > 0 and db_status == '⏳ Наблюдение':
                  conn.execute("UPDATE ai_forecasts SET status = '✅ Точный прогноз' WHERE id = ?", (row['id'],))
+                 
         conn.commit()
 
 # --- НАСТРОЙКИ ПУТЕЙ ---
@@ -1702,8 +1706,15 @@ elif st.session_state.current_page == "⚖️ A/B Тест: AI vs Человек
     verify_shadow_forecasts()
     
     with get_connection() as conn:
-        df_forecasts = pd.read_sql_query("SELECT * FROM ai_forecasts ORDER BY created_at DESC", conn)
-        
+        # Подтягиваем прогнозы + актуальный остаток прямо из таблицы stocks
+        df_forecasts = pd.read_sql_query("""
+            SELECT 
+                f.*,
+                (SELECT quantity FROM stocks s WHERE s.item_name = f.item_name ORDER BY report_timestamp DESC LIMIT 1) as current_qty
+            FROM ai_forecasts f 
+            ORDER BY f.created_at DESC
+        """, conn)
+
     if df_forecasts.empty:
         st.info("Пока нет активных прогнозов. Сгенерируйте их с помощью кнопки ниже.")
     else:
@@ -1718,16 +1729,19 @@ elif st.session_state.current_page == "⚖️ A/B Тест: AI vs Человек
         st.write("---")
         st.write("**Детализация (Журнал прогнозов и финансовых последствий):**")
         
-        # Берем нужные колонки
-        display_df = df_forecasts[['created_at', 'item_name', 'predicted_zero_date', 'recommended_qty', 'reason', 'status', 'lost_sales_value', 'overstock_value']].copy()
+        # Берем нужные колонки (добавлен current_qty)
+        display_df = df_forecasts[['created_at', 'item_name', 'current_qty', 'predicted_zero_date', 'recommended_qty', 'reason', 'status', 'lost_sales_value', 'overstock_value']].copy()
         
-        # РАЗДЕЛЯЕМ ПОНЯТИЯ: Упущенная выручка (чистый убыток) и Замороженный капитал
+        # Делаем остаток красивым целым числом
+        display_df['current_qty'] = display_df['current_qty'].fillna(0).astype(int)
+        
         display_df['Упущенная выручка (₽)'] = display_df['lost_sales_value'].apply(lambda x: f"{x:,.0f} ₽".replace(',', ' ') if x > 0 else "")
         display_df['Заморожено (₽)'] = display_df['overstock_value'].apply(lambda x: f"{x:,.0f} ₽".replace(',', ' ') if x > 0 else "")
         
         display_df.rename(columns={
             'created_at': 'Дата прогноза',
             'item_name': 'Товар',
+            'current_qty': 'Остаток (шт)',  # <--- ВОТ ЭТА НОВАЯ СТРОЧКА
             'predicted_zero_date': 'ИИ: Обнулится',
             'recommended_qty': 'ИИ: Заказать (шт)',
             'reason': 'Обоснование',
