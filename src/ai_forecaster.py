@@ -70,20 +70,34 @@ def run_batch_forecast():
                 items_data.append({
                     "name": row['item_name'],
                     "sku": row['sku'],
-                    "stock": row['current_qty'],
+                    "stock": int(row['current_qty']),
                     "avg_sales": round(avg_sales, 2)
                 })
 
-            prompt = f"""
-            Ты директор по закупкам. Проанализируй список товаров и дай прогноз.
-            Учти: доставка занимает 14 дней. Нужно обеспечить запас на 30 дней.
+            # Добавляем текущую дату, чтобы ИИ не бредил датами из прошлого
+            today_date = pd.Timestamp.now().strftime('%Y-%m-%d')
             
-            Список товаров:
+            prompt = f"""
+            Ты — эксперт-аналитик по закупкам. Сегодня: {today_date}.
+            Проанализируй данные по товарам и рассчитай потребность.
+            
+            ПРАВИЛА:
+            1. Используй ТОЛЬКО цифры 'stock' и 'avg_sales' из списка ниже. Не выдумывай свои остатки!
+            2. Срок поставки: 14 дней. Целевой запас: 30 дней (итого горизонт 44 дня).
+            3. Если 'stock' равен 0 — это КРИТИЧЕСКИЙ ДЕФИЦИТ. Рекомендуй закупку немедленно.
+            4. В 'reason' кратко опиши расчет: (Продажи в день * 44 дня) - текущий остаток.
+            5. 'predicted_zero_date' ДОЛЖНА БЫТЬ в будущем (после {today_date}). 
+               Расчет: {today_date} + (остаток / продажи_в_день).
+            6. 'item_name' и 'sku' возвращай СТРОГО без изменений, как в данных.
+            7. Если продажи (avg_sales) = 0, пиши дату '2099-12-31' (бесконечный запас).
+            8. В 'reason' пиши кратко формулу расчета.
+            
+            Данные (в формате JSON):
             {json.dumps(items_data, ensure_ascii=False)}
             
-            ВЕРНИ СТРОГО JSON МАССИВ ОБЪЕКТОВ:
+            ВЕРНИ СТРОГО JSON МАССИВ:
             [
-              {{"item_name": "...", "sku": "...", "predicted_zero_date": "YYYY-MM-DD", "recommended_qty": 100, "reason": "..."}}
+              {{"item_name": "...", "sku": "...", "predicted_zero_date": "ГГГГ-ММ-ДД", "recommended_qty": число, "reason": "..."}}
             ]
             """
             
@@ -119,22 +133,42 @@ def run_batch_forecast():
                 for f in forecasts:
                     avg_s = next((item['avg_sales'] for item in items_data if item['name'] == f['item_name']), 0)
                     
-                    # 1. Сначала отменяем старые несыгравшие прогнозы по этому товару
-                    conn.execute("""
-                        UPDATE ai_forecasts 
-                        SET status = '🔄 Пересчитан ИИ' 
-                        WHERE item_name = ? AND status = '⏳ Наблюдение'
-                    """, (f['item_name'],))
+                    # --- НОВАЯ ЛОГИКА ЗАЩИТЫ ОТ ДУБЛЕЙ (UPSERT) ---
+                    # Проверяем, делали ли мы уже прогноз по этому товару СЕГОДНЯ
+                    existing_today = conn.execute("""
+                        SELECT id FROM ai_forecasts 
+                        WHERE item_name = ? AND date(created_at) = date('now', 'localtime')
+                    """, (f['item_name'],)).fetchone()
                     
-                    # 2. Затем записываем новый, самый актуальный прогноз
-                    conn.execute("""
-                        INSERT INTO ai_forecasts (item_name, sku, predicted_zero_date, recommended_qty, reason, avg_daily_sales)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (f['item_name'], f['sku'], f['predicted_zero_date'], f['recommended_qty'], f['reason'], avg_s))
+                    if existing_today:
+                        # Если прогноз уже был сегодня — просто перезаписываем его цифры поверх
+                        conn.execute("""
+                            UPDATE ai_forecasts 
+                            SET predicted_zero_date = ?, 
+                                recommended_qty = ?, 
+                                reason = ?, 
+                                avg_daily_sales = ?,
+                                status = '⏳ Наблюдение'
+                            WHERE id = ?
+                        """, (f['predicted_zero_date'], f['recommended_qty'], f['reason'], avg_s, existing_today[0]))
+                    else:
+                        # Если сегодня прогноза еще не было:
+                        # 1. Отменяем старые (вчерашние и старше) прогнозы
+                        conn.execute("""
+                            UPDATE ai_forecasts 
+                            SET status = '🔄 Пересчитан ИИ' 
+                            WHERE item_name = ? AND status = '⏳ Наблюдение'
+                        """, (f['item_name'],))
+                        
+                        # 2. Создаем абсолютно новую запись
+                        conn.execute("""
+                            INSERT INTO ai_forecasts (item_name, sku, predicted_zero_date, recommended_qty, reason, avg_daily_sales)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, (f['item_name'], f['sku'], f['predicted_zero_date'], f['recommended_qty'], f['reason'], avg_s))
                 
                 conn.commit()
                 success_count += len(forecasts)
-                time.sleep(6) 
+                time.sleep(6)
                 
         return f"ok_{success_count}"
 

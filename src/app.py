@@ -42,10 +42,14 @@ def color_rows(row):
     return [colors.get(anomaly_type, '')] * len(row)
 
 def verify_shadow_forecasts():
-    """Шаг 3: Проверка старых прогнозов (Shadow Mode с динамическим счетчиком)"""
+    """Обновленная логика: следим за всеми активными прогнозами"""
     with get_connection() as conn:
-        # ТЕПЕРЬ мы проверяем и новые прогнозы, и те, по которым уже "капает" счетчик отсутствия
-        forecasts = pd.read_sql_query("SELECT * FROM ai_forecasts WHERE status IN ('⏳ Наблюдение', '🔴 Товар отсутствует')", conn)
+        # 1. Теперь берем ВСЕ статусы, кроме финальных (Упущенная выгода и Точный прогноз)
+        forecasts = pd.read_sql_query("""
+            SELECT * FROM ai_forecasts 
+            WHERE status NOT IN ('📉 Упущенная выгода', '✅ Точный прогноз', '🔄 Пересчитан ИИ')
+        """, conn)
+        
         if forecasts.empty: return
         
         latest_inv = load_inventory()
@@ -54,49 +58,51 @@ def verify_shadow_forecasts():
         today = pd.Timestamp.now().normalize()
         
         for _, row in forecasts.iterrows():
-            item = row['item_name']
-            db_status = row['status']
+            item_name = row['item_name']
+            sku = row['sku']
+            db_id = row['id']
             
-            # Безопасный поиск товара
-            match = latest_inv[latest_inv['Наименование'] == item]
-            if match.empty: continue
+            # УМНЫЙ ПОИСК: Сначала по SKU (он уникален), если нет - по имени
+            match = pd.DataFrame()
+            if pd.notna(sku) and str(sku).strip():
+                match = latest_inv[latest_inv['Артикул'] == sku]
             
-            curr_qty = match.iloc[0]['Остаток']
-            price = match.iloc[0]['Цена']
+            if match.empty:
+                match = latest_inv[latest_inv['Наименование'] == item_name]
+
+            if match.empty: continue # Все еще не нашли - пропускаем
+            
+            curr_qty = float(match.iloc[0]['Остаток'])
+            price = float(match.iloc[0]['Цена'])
+            avg_sales = float(row['avg_daily_sales'])
             pred_date = pd.Timestamp(row['predicted_zero_date'])
-            avg_sales = row['avg_daily_sales']
-            
-            # ЛОГИКА 1: Товар обнулился (Включаем счетчик или продолжаем прибавлять дни)
-            if curr_qty == 0 and today >= pred_date:
-                days_lost = max(1, (today - pred_date).days)
+
+            # ЖЕСТКАЯ ПРОВЕРКА НА 0 (Твой главный запрос)
+            if curr_qty <= 0:
+                effective_pred_date = min(today, pred_date)
+                days_lost = max(1, (today - effective_pred_date).days)
                 lost_value = days_lost * avg_sales * price
-                # Статус становится красным, убыток обновляется каждый день!
-                conn.execute("UPDATE ai_forecasts SET status = '🔴 Товар отсутствует', lost_sales_value = ? WHERE id = ?", (lost_value, row['id']))
                 
-            # ЛОГИКА 2: Товар ПРИЕХАЛ после долгого отсутствия (Останавливаем счетчик)
-            elif curr_qty > 0 and db_status == '🔴 Товар отсутствует':
-                # Сумма убытка уже посчитана за прошлый день, просто фиксируем финальный статус
-                conn.execute("UPDATE ai_forecasts SET status = '📉 Упущенная выгода' WHERE id = ?", (row['id'],))
-                
-            # ЛОГИКА 3: Замороженный капитал (только для новых прогнозов)
-            elif curr_qty > (avg_sales * 60) and db_status == '⏳ Наблюдение':
-                recent_penalty = conn.execute("""
-                    SELECT 1 FROM ai_forecasts 
-                    WHERE item_name = ? AND status = '🧊 Перезатарка' AND created_at >= date('now', '-30 days', 'localtime')
-                """, (item,)).fetchone()
-                
-                if not recent_penalty:
-                    overstock_qty = curr_qty - (avg_sales * 44)
-                    if overstock_qty > 0:
-                        overstock_value = overstock_qty * price
-                        conn.execute("UPDATE ai_forecasts SET status = '🧊 Перезатарка', overstock_value = ? WHERE id = ?", (overstock_value, row['id']))
-                else:
-                    conn.execute("UPDATE ai_forecasts SET status = '🔄 Пересчитан ИИ' WHERE id = ?", (row['id'],))
-                
-            # ЛОГИКА 4: Идеальное попадание (Наступил день Х, остаток мал, но не ноль)
-            elif today >= pred_date and curr_qty <= (avg_sales * 5) and curr_qty > 0 and db_status == '⏳ Наблюдение':
-                 conn.execute("UPDATE ai_forecasts SET status = '✅ Точный прогноз' WHERE id = ?", (row['id'],))
-                 
+                conn.execute("""
+                    UPDATE ai_forecasts 
+                    SET status = '🔴 Товар отсутствует', lost_sales_value = ?, overstock_value = 0 
+                    WHERE id = ?
+                """, (lost_value, db_id))
+                continue
+
+            # Если товар ЕСТЬ, проверяем на Перезатарку (запас > 60 дней)
+            if curr_qty > (avg_sales * 60):
+                overstock_qty = curr_qty - (avg_sales * 44)
+                overstock_value = max(0, overstock_qty * price)
+                conn.execute("""
+                    UPDATE ai_forecasts 
+                    SET status = '🧊 Перезатарка', overstock_value = ?, lost_sales_value = 0 
+                    WHERE id = ?
+                """, (overstock_value, db_id))
+            else:
+                # Если остаток в норме, возвращаем в Наблюдение
+                conn.execute("UPDATE ai_forecasts SET status = '⏳ Наблюдение' WHERE id = ?", (db_id,))
+        
         conn.commit()
 
 # --- НАСТРОЙКИ ПУТЕЙ ---
@@ -1724,7 +1730,7 @@ elif st.session_state.current_page == "⚖️ A/B Тест: AI vs Человек
         
         m1, m2 = st.columns(2)
         m1.metric("📉 Упущенная выгода (Prevented Lost Sales)", f"{total_lost:,.0f} ₽".replace(',', ' '), help="Сколько компания потеряла из-за того, что товар кончился, а закупка не была сделана вовремя.")
-        m2.metric("🧊 Замороженный капитал (Cost of Overstock)", f"{total_overstock:,.0f} ₽".replace(',', ' '), help="Сумма излишков, купленных сверх рекомендаций ИИ.")
+        m2.metric("🧊 Замороженный капитал за последние 30 дней (Cost of Overstock)", f"{total_overstock:,.0f} ₽".replace(',', ' '), help="Сумма излишков, купленных сверх рекомендаций ИИ.")
         
         st.write("---")
         st.write("**Детализация (Журнал прогнозов и финансовых последствий):**")
