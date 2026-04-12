@@ -23,6 +23,11 @@ def run_batch_forecast():
     if not api_key: 
         return "no_key"
 
+    import os
+    os.environ['HTTPS_PROXY'] = "socks5://127.0.0.1:1080"
+    os.environ['HTTP_PROXY'] = "socks5://127.0.0.1:1080"
+    logging.info("🛡️ Прокси активирован для сессии ИИ")
+
     client = genai.Client(api_key=api_key)
 
     with sqlite3.connect(DB_PATH) as conn:

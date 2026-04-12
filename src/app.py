@@ -14,7 +14,10 @@ import math
 def check_gemini_connection():
     import requests
     try:
-        # Пингуем Google. Кэшируем результат на 60 секунд.
+        proxies = {
+            "http": "socks5://127.0.0.1:1080",
+            "https": "socks5://127.0.0.1:1080"
+        }
         requests.get("https://generativelanguage.googleapis.com", timeout=1.5)
         return True
     except:
@@ -1561,15 +1564,20 @@ elif st.session_state.current_page == "📥 Приемка":
     st.subheader("📸 Оцифровка накладной (Нейро-приемка)")
     st.caption("Загрузите фото таблицы с товарами. Цены и контрагентов в кадр брать не нужно.")
     
-    # Используем новый SDK google-genai
+
     from google import genai 
     from PIL import Image
     import json
+    import os
     
     api_key = st.secrets["GEMINI_API_KEY"]
     
     if api_key:
-        # Инициализируем нового клиента (стандарт 2026 года)
+
+        os.environ['HTTPS_PROXY'] = "socks5://127.0.0.1:1080"
+        os.environ['HTTP_PROXY'] = "socks5://127.0.0.1:1080"
+
+
         client = genai.Client(api_key=api_key)
         
         # Оставляем только загрузку из галереи по твоей просьбе
