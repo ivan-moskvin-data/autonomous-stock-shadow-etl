@@ -78,7 +78,12 @@ def verify_shadow_forecasts():
             curr_qty = float(match.iloc[0]['Остаток'])
             price = float(match.iloc[0]['Цена'])
             avg_sales = float(row['avg_daily_sales'])
-            pred_date = pd.Timestamp(row['predicted_zero_date'])
+            
+            # --- ЗАЩИТА ОТ ИИ-ГАЛЛЮЦИНАЦИЙ (37 апреля и т.д.) ---
+            pred_date = pd.to_datetime(row['predicted_zero_date'], errors='coerce')
+            if pd.isna(pred_date): 
+                # Если дата кривая (NaT), ставим безопасную заглушку от "сегодня"
+                pred_date = today + pd.Timedelta(days=30)
 
             # ЖЕСТКАЯ ПРОВЕРКА НА 0 (Твой главный запрос)
             if curr_qty <= 0:
