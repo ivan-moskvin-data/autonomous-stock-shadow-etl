@@ -6,7 +6,25 @@ def get_anomalies_query() -> str:
             SUM(CASE WHEN SUBSTR(report_timestamp, 1, 10) = :yesterday THEN quantity ELSE 0 END) as qty_old,
             SUM(CASE WHEN SUBSTR(report_timestamp, 1, 10) = :today THEN quantity ELSE 0 END) as qty_new,
             (SUM(CASE WHEN SUBSTR(report_timestamp, 1, 10) = :today THEN quantity ELSE 0 END) - 
-             SUM(CASE WHEN SUBSTR(report_timestamp, 1, 10) = :yesterday THEN quantity ELSE 0 END)) as delta
+             SUM(CASE WHEN SUBSTR(report_timestamp, 1, 10) = :yesterday THEN quantity ELSE 0 END)) as delta,
+            
+            -- Проверяем наличие истории ДО вчерашнего дня
+            (SELECT COUNT(*) FROM stocks s_hist 
+             WHERE s_hist.item_name = stocks.item_name 
+             AND SUBSTR(s_hist.report_timestamp, 1, 10) < :yesterday) as history_count,
+             
+            -- Проверяем, встречался ли такой артикул с другим названием (поиск переименования)
+            (SELECT item_name FROM stocks s_sku 
+             WHERE s_sku.sku = stocks.sku 
+             AND s_sku.item_name != stocks.item_name 
+             LIMIT 1) as old_name_alias
+
+            -- Проверяем, встречалось ли такое имя с другим артикулом
+            (SELECT sku FROM stocks s_name
+             WHERE s_name.item_name = stocks.item_name 
+             AND s_name.sku != stocks.sku AND s_name.sku != ''
+             LIMIT 1) as old_sku_alias
+             
         FROM stocks
         WHERE (SUBSTR(report_timestamp, 1, 10) = :today OR SUBSTR(report_timestamp, 1, 10) = :yesterday)
           AND item_name IS NOT NULL

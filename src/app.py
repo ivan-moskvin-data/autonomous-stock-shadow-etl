@@ -777,7 +777,43 @@ elif st.session_state.current_page == "⚠️ Аномалии":
             with st.container():
                 c = st.columns(COL_RATIOS)
                 c[0].write(row['Артикул'])
-                c[1].write(row['Наименование'])
+                
+                hist_count = row.get('history_count', 0)
+                old_alias = row.get('old_name_alias', None)
+                old_sku = row.get('old_sku_alias', None)
+                qty_old = row['Было']
+
+                # 1. ПРОВЕРКА НА АКТИВНЫЙ ТОВАР
+                if qty_old > 0:
+                    status_tag = "📦 ДОВОЗ"
+                    help_text = "Обычное пополнение активного товара."
+                    color = "gray"
+                
+                # 2. ПРОВЕРКИ НА ОБНОВЛЕНИЕ КАРТОЧКИ (Оранжевая зона)
+                elif pd.notna(old_alias) and old_alias:
+                    status_tag = "📝 СМЕНИЛОСЬ ИМЯ"
+                    help_text = f"Артикул знаком, но раньше назывался: {old_alias}."
+                    color = "orange"
+                elif pd.notna(old_sku) and old_sku:
+                    status_tag = "📝 СМЕНИЛСЯ АРТИКУЛ"
+                    help_text = f"Имя знакомо, но старый артикул был: {old_sku}."
+                    color = "orange"
+                    
+                # 3. ПРОВЕРКИ НА ВОЗВРАТ И НОВИНКУ
+                elif hist_count > 0:
+                    status_tag = "🔄 ВОЗВРАТ"
+                    help_text = "Товар уже был в базе, но отсутствовал некоторое время. Жми 'Плановый приход'."
+                    color = "blue"
+                else:
+                    status_tag = "✨ НОВИНКА"
+                    help_text = "Абсолютно новый товар. В базе истории нет."
+                    color = "green"
+
+                # Название + Индикатор во второй колонке
+                with c[1]:
+                    st.write(row['Наименование'])
+                    st.caption(f":{color}[{status_tag}] {help_text}")
+
                 c[2].write(row['Было'])
                 c[3].write(row['Стало'])
                 c[4].write(f":green[+{row['Дельта']}]")
