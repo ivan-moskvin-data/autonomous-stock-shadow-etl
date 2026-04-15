@@ -1627,8 +1627,8 @@ elif st.session_state.current_page == "📥 Приемка":
         if file_photo:
             st.image(file_photo, caption="📸 Фото загружено", width=400)
             
-            if st.button("🚀 Отправить в Gemini 3.1 на оцифровку", type="primary", use_container_width=True):
-                with st.spinner("🧠 Нейросеть Gemini 3.1 Flash Lite читает таблицу..."):
+            if st.button("🚀 Отправить на оцифровку", type="primary", use_container_width=True):
+                with st.spinner("🧠 Нейросеть Gemini читает таблицу..."):
                     try:
                         img = Image.open(file_photo)
                         
@@ -1654,7 +1654,7 @@ elif st.session_state.current_page == "📥 Приемка":
                         
                         # Вызов через новый SDK и модель 3.1 Flash Lite
                         response = client.models.generate_content(
-                            model="gemini-3.1-flash-lite-preview",
+                            model="gemini-2.5-flash",
                             contents=[prompt, img]
                         )
                         

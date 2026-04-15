@@ -17,7 +17,7 @@ def get_anomalies_query() -> str:
             (SELECT item_name FROM stocks s_sku 
              WHERE s_sku.sku = stocks.sku 
              AND s_sku.item_name != stocks.item_name 
-             LIMIT 1) as old_name_alias
+             LIMIT 1) as old_name_alias,
 
             -- Проверяем, встречалось ли такое имя с другим артикулом
             (SELECT sku FROM stocks s_name

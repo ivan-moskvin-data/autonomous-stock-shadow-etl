@@ -95,7 +95,7 @@ def run_batch_forecast():
             1. 'days_to_zero' — это через СКОЛЬКО ДНЕЙ кончится товар (остаток / продажи_в_день). Это должно быть целое число!
             2. 'item_name' и 'sku' возвращай СТРОГО без изменений.
             3. Если продажи (avg_sales) = 0, пиши 'days_to_zero': 999 (бесконечный запас).
-            4. В 'reason' пиши кратко формулу расчета.
+            4. В 'reason' напиши краткое и понятное обоснование на РУССКОМ языке. Например: "Остаток 278 шт, при продажах 7.6 шт/день хватит на 36 дней. Запас достаточен" или "Хватит на 5 дней, нужно дозаказать 100 шт для покрытия месяца". Не используй переменные и код!
             
             ВЕРНИ СТРОГО JSON МАССИВ:
             [
@@ -110,7 +110,11 @@ def run_batch_forecast():
             
             for attempt in range(MAX_RETRIES):
                 try:
-                    res = client.models.generate_content(model="gemini-3.1-flash-lite-preview", contents=[prompt])
+                    res = client.models.generate_content(
+                        model='gemini-2.5-flash',
+                        contents=prompt,
+                        config={"temperature": 0.1, "response_mime_type": "application/json"} # Убиваем креатив
+                    )
                     forecasts = json.loads(res.text.replace("```json", "").replace("```", "").strip())
                     break  # Успешно получили данные! Выходим из цикла повторов
                 
