@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from queries import get_anomalies_query, get_insert_anomaly_query, get_close_anomaly_query, get_cancel_anomaly_query
+from queries import get_anomalies_query, get_insert_anomaly_query, get_close_anomaly_query, get_cancel_anomaly_query, get_sla_metrics_query
 
 import math
 
@@ -85,7 +85,6 @@ def verify_shadow_forecasts():
                 # Если дата кривая (NaT), ставим безопасную заглушку от "сегодня"
                 pred_date = today + pd.Timedelta(days=30)
 
-            # ЖЕСТКАЯ ПРОВЕРКА НА 0 (Твой главный запрос)
             if curr_qty <= 0:
                 effective_pred_date = min(today, pred_date)
                 days_lost = max(1, (today - effective_pred_date).days)
@@ -1079,6 +1078,27 @@ elif st.session_state.current_page == "🎯 Эффективность":
         S_MTTR_NORM = 8.0 
         mttr_delta_color = "normal" if mttr_median <= S_MTTR_NORM else "inverse"
 
+        # --- 6. РАСЧЕТ SLA COMPLIANCE RATE (ДОЛЯ В ВАЛЮТЕ ВРЕМЕНИ) ---
+        with get_connection() as conn:
+            # S_MTTR_NORM у нас задан выше (8.0 часов). Используем его, чтобы 
+            # нормативы MTTR и SLA ссылались на одно и то же бизнес-правило.
+            sla_df = pd.read_sql_query(get_sla_metrics_query(sla_hours=S_MTTR_NORM), conn)
+
+        # Безопасно извлекаем данные. Если задач еще нет, ставим 100% авансом.
+        if not sla_df.empty and sla_df.iloc[0]['total_resolved'] > 0:
+            total_resolved = sla_df.iloc[0]['total_resolved']
+            within_sla = sla_df.iloc[0]['within_sla']
+            
+            # Защита от пустого значения (NaN), если база вернула NULL
+            if pd.isna(within_sla): within_sla = 0 
+                
+            sla_compliance_rate = (within_sla / total_resolved) * 100
+        else:
+            sla_compliance_rate = 100.0
+            
+        # Красим метрику в красный, если мы выполняем норматив реже, чем в 90% случаев
+        sla_color = "normal" if sla_compliance_rate >= 90 else "inverse"
+
         # --- РАСЧЕТЫ (Порядок важен для предотвращения NameError) ---
         total_checks = len(df_kpi)
         
@@ -1112,10 +1132,10 @@ elif st.session_state.current_page == "🎯 Эффективность":
             display_m = 0
         time_str = f"{display_h} ч. {display_m} мин."
 
-        # --- ОТРИСОВКА ДАШБОРДА (Сетка 3х2 с обновленным неймингом) ---
+        # --- ОТРИСОВКА ДАШБОРДА (Сетка с обновленным неймингом) ---
         
-        # Строка 1: Управление рисками и временем
-        r1_c1, r1_c2, r1_c3 = st.columns(3)
+        # Строка 1: Управление рисками, качеством (MTTR/SLA) и временем
+        r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
         
         with r1_c1:
             st.metric("Risk - Предотвращено риска", f"{total_risk_days_saved:,.0f} дн.".replace(',', ' '), 
@@ -1123,16 +1143,16 @@ elif st.session_state.current_page == "🎯 Эффективность":
                       help=f"Суммарный лаг обнаружения. 365 дн. для неликвидов и {AVG_MANUAL_DETECTION_DAYS} дн. для активного стока.")
             
         with r1_c2:
-            # Передвинули MTTR на второе место первой строки
             st.metric("MTTR - Время устранения", mttr_display, 
                       delta=f"SLA: {S_MTTR_NORM}ч", delta_color=mttr_delta_color,
-                      help=f"""
-                      Median Time to Resolve: показатель операционной дисциплины. 
-                      Показывает типичное время реакции склада на проблему. 
-                      Норма (SLA): до {S_MTTR_NORM} часов.
-                      """)
+                      help=f"Median Time to Resolve: типичное время реакции склада на проблему.")
             
         with r1_c3:
+            st.metric("SLA Compliance", f"{sla_compliance_rate:.1f}%", 
+                      delta="Цель: >90%", delta_color=sla_color,
+                      help=f"Доля инцидентов, устраненных в рамках норматива ({S_MTTR_NORM} ч.). Показывает стабильность процессов.")
+
+        with r1_c4:
             st.metric("Time - Сэкономлено времени", time_str, 
                       help=f"Рутина: {routine_saved_hours:.2f}ч + Коммуникации: {communication_saved_hours:.2f}ч")
 

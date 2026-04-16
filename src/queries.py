@@ -65,3 +65,19 @@ def get_close_anomaly_query() -> str:
             comment = :comment
     WHERE id = :id
     """
+
+def get_sla_metrics_query(sla_hours=4) -> str:
+    """
+    Считает процент соблюдения SLA (задачи, закрытые быстрее чем за N часов).
+    """
+    return f"""
+        SELECT 
+            COUNT(*) as total_resolved,
+            SUM(CASE 
+                WHEN (julianday(resolved_at) - julianday(detected_at)) * 24 <= {sla_hours} 
+                THEN 1 ELSE 0 
+            END) as within_sla
+        FROM anomaly_log
+        WHERE resolved_at IS NOT NULL 
+          AND status != 'Отменена'
+    """
