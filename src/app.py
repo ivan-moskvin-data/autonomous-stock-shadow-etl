@@ -697,29 +697,51 @@ if st.session_state.current_page == "📦 Склад":
                 }
             )
 
-            # --- НОВЫЙ БЛОК: ИСЧЕЗНУВШИЕ ТОВАРЫ ---
+            # --- НОВЫЙ БЛОК: ИСЧЕЗНУВШИЕ ТОВАРЫ (С ИНТЕРАКТИВОМ) ---
             if len(df_stats) > 1:
                 yesterday_date = df_stats.iloc[1]['parse_date']
                 
                 # Ищем товары, которые парсер видел вчера, но не увидел сегодня
-                lost_items = df_inv[(df_inv['last_seen_date'] == yesterday_date) & (~df_inv['actual'])]
+                lost_items = df_inv[(df_inv['last_seen_date'] == yesterday_date) & (~df_inv['actual'])].copy()
+                
+                # Убираем те, которые мы уже обработали (кликнули кнопки)
+                lost_items = lost_items[~lost_items['Наименование'].isin(st.session_state.dismissed_names)]
                 
                 if not lost_items.empty:
-                    with st.expander(f"📉 Сняты с сайта при последнем парсинге ({len(lost_items)} шт.)"):
-                        st.caption(f"Эти позиции были в выгрузке за {yesterday_date}, но сегодня отсутствуют.")
-                        display_lost = lost_items[['Артикул', 'Наименование', 'Цена', 'Остаток']].copy()
+                    with st.expander(f"📉 Сняты с сайта (Требует проверки: {len(lost_items)} шт.)", expanded=True):
+                        st.warning("👀 **Слепая зона:** Эти товары исчезли с сайта. Подтвердите физическое наличие на полке.")
                         
-                        st.dataframe(
-                            display_lost, 
-                            use_container_width=True, 
-                            hide_index=True,
-                            column_config={
-                                "Цена": st.column_config.NumberColumn(format="%d ₽"),
-                                "Остаток": st.column_config.NumberColumn(format="%d шт.")
-                            }
-                        )
+                        for idx, row in lost_items.iterrows():
+                            c = st.columns([2, 4, 2, 3])
+                            c[0].write(f"🏷️ {row['Артикул']}")
+                            c[1].write(row['Наименование'])
+                            c[2].write(f"Было: **{row['Остаток']} шт.**")
+                            
+                            btn_col1, btn_col2 = c[3].columns(2)
+                            
+                            # КНОПКА 1: Легальная продажа (Убираем из списка без записи в аномалии)
+                            if btn_col1.button("🛒 Продан", key=f"lost_sold_{row['ID']}", help="Товара реально больше нет на полке", use_container_width=True):
+                                st.session_state.dismissed_names.append(row['Наименование'])
+                                st.rerun()
+                                
+                            # КНОПКА 2: Ошибка витрины (Баг - пишем в KPI)
+                            if btn_col2.button("🚨 Баг 1С", key=f"lost_bug_{row['ID']}", help="Товар лежит на полке, но сайт его скрыл!", type="primary", use_container_width=True):
+                                save_anomaly_to_db({
+                                    "item_name": row['Наименование'],
+                                    "anomaly_type": "Скрыт с витрины (Баг)",
+                                    "qty_system": 0, # На сайте 0 (его нет)
+                                    "qty_physical": row['Остаток'], # По факту он есть
+                                    "financial_impact": row['Остаток'] * row['Цена'], # Упущенная выгода!
+                                    "source": "Автоматически",
+                                    "status": "Закрыта", # Закрываем сразу, чтобы не висел в задачах
+                                    "comment": "Товар физически на складе, но исчез с сайта (Упущенная выручка)"
+                                })
+                                st.session_state.dismissed_names.append(row['Наименование'])
+                                st.toast("✅ Инцидент 'Упущенная выручка' записан в KPI!")
+                                st.rerun()
+                            st.divider()
                 else:
-                    st.success("✅ С момента прошлого парсинга ни один товар не пропал с сайта.")
+                    st.success("✅ С момента прошлого парсинга ни один товар не пропал с сайта, либо все пропажи уже проверены.")
 
 # 2. СТРАНИЦА АНОМАЛИЙ
 elif st.session_state.current_page == "⚠️ Аномалии":
@@ -1175,6 +1197,81 @@ elif st.session_state.current_page == "🎯 Эффективность":
                       help=f"Сохранено деревьев исходя из объема нераспечатанной бумаги ({sheets_saved:.2f} стр.)")
 
     st.divider()
+
+    # --- НОВЫЙ РАЗДЕЛ: ЗДОРОВЬЕ ВИТРИНЫ (Ghosting Rate) ---
+    st.subheader("👻 Уровень мерцания сайта (Ghosting Rate)")
+    st.caption("Показывает количество товаров, которые вчера имели положительный остаток, а сегодня бесследно пропали с витрины.")
+    
+    with get_connection() as conn:
+        ghost_query = """
+            WITH DailyStocks AS (
+                SELECT 
+                    SUBSTR(report_timestamp, 1, 10) as date,
+                    item_name,
+                    quantity
+                FROM stocks
+                WHERE quantity > 0
+            )
+            SELECT 
+                d1.date as "Дата",
+                COUNT(d1.item_name) as "Пропало на следующий день"
+            FROM DailyStocks d1
+            LEFT JOIN DailyStocks d2 
+                ON d1.item_name = d2.item_name 
+                AND date(d2.date) = date(d1.date, '+1 day')
+            WHERE d2.item_name IS NULL 
+              AND d1.date < date('now', 'localtime')
+            GROUP BY d1.date
+            ORDER BY d1.date ASC
+        """
+        df_ghosts = pd.read_sql_query(ghost_query, conn)
+        
+    if not df_ghosts.empty and len(df_ghosts) > 1:
+        st.bar_chart(df_ghosts.set_index("Дата"), color="#ff4b4b")
+        avg_ghosts = df_ghosts["Пропало на следующий день"].mean()
+        if avg_ghosts > 0:
+            st.info(f"💡 В среднем **{int(avg_ghosts)}** товаров исчезает с сайта каждый день. На вкладке '📦 Склад' вы вручную классифицируете: легальная ли это продажа под ноль, или 'Баг 1С'.")
+    else:
+        st.success("Мало данных для построения графика мерцания или сайт работает идеально.")
+    
+    st.divider()
+
+    st.write("---")
+    st.write("**💸 Оценка упущенной выгоды (Risk Value Modeling)**")
+
+    # 1. Запрашиваем из базы сумму ущерба всех зафиксированных багов 1С
+    with get_connection() as conn:
+        bug_impact_query = "SELECT SUM(financial_impact) FROM anomaly_log WHERE anomaly_type = 'Скрыт с витрины (Баг)'"
+        total_max_risk_result = conn.execute(bug_impact_query).fetchone()[0]
+
+    # Если багов еще нет, SQL вернет None. Защищаемся от ошибки, ставя 0.
+    total_max_risk = total_max_risk_result if total_max_risk_result else 0
+
+    # 2. Создаем колонки для красоты: слева ползунок, справа цифра
+    risk_col1, risk_col2 = st.columns([1, 2])
+    
+    with risk_col1:
+        # Streamlit slider: ползунок от 1% до 100%
+        online_share = st.slider(
+            "Доля сайта в продажах (%)",
+            min_value=1,
+            max_value=100,
+            value=5, # 5% - наша консервативная стартовая оценка
+            help="Коэффициент атрибуции канала. Какая доля из этих товаров реально продалась бы через онлайн-витрину?"
+        )
+
+    # 3. Математика: умножаем общий риск на выбранный процент
+    adjusted_lost_sales = total_max_risk * (online_share / 100)
+
+    with risk_col2:
+        # Красиво выводим метрику
+        st.metric(
+            "Скрытая упущенная выгода (Ghosting Loss)",
+            f"{adjusted_lost_sales:,.0f} ₽".replace(',', ' '),
+            help=f"Формула: Максимальный риск ({total_max_risk:,.0f} ₽) × {online_share}% вероятности продажи"
+        )
+
+    st.write("---")
 
     # --- РАЗДЕЛ 1: SYSTEM IQ (Дневная динамика) ---
     st.subheader("🤖 System IQ (Daily Health & Intel)")
