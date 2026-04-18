@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 import sqlite3
+import db
 from contextlib import contextmanager
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -46,7 +47,7 @@ def color_rows(row):
 
 def verify_shadow_forecasts():
     """Обновленная логика: следим за всеми активными прогнозами"""
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         # 1. Теперь берем ВСЕ статусы, кроме финальных (Упущенная выгода и Точный прогноз)
         forecasts = pd.read_sql_query("""
             SELECT * FROM ai_forecasts 
@@ -55,7 +56,7 @@ def verify_shadow_forecasts():
         
         if forecasts.empty: return
         
-        latest_inv = load_inventory()
+        latest_inv = db.load_inventory()
         if latest_inv.empty: return
         
         today = pd.Timestamp.now().normalize()
@@ -112,9 +113,7 @@ def verify_shadow_forecasts():
         
         conn.commit()
 
-# --- НАСТРОЙКИ ПУТЕЙ ---
-BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / "data" / "stock_history.sqlite"
+
 
 st.set_page_config(page_title="Stock Shadow | Analytics", page_icon="💎", layout="wide")
 
@@ -124,9 +123,9 @@ st.markdown("<style>#MainMenu {visibility: hidden;} footer {visibility: hidden;}
 # --- ИНИЦИАЛИЗАЦИЯ ПАМЯТИ ---
 if 'dismissed_names' not in st.session_state:
     st.session_state.dismissed_names = []
-    if DB_PATH.exists():
+    if db.DB_PATH.exists():
         try:
-            with sqlite3.connect(DB_PATH) as conn:
+            with sqlite3.connect(db.DB_PATH) as conn:
                 # Создаем таблицу для хранения связей старых и новых имен
                 conn.execute("CREATE TABLE IF NOT EXISTS item_aliases (new_name TEXT, old_name TEXT)")
                 conn.execute("""
@@ -165,231 +164,17 @@ if 'current_page' not in st.session_state:
 if 'selected_item_name' not in st.session_state:
     st.session_state.selected_item_name = None
 
-# --- ФУНКЦИИ ЗАГРУЗКИ ---
-@contextmanager
-def get_connection(): 
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-@st.cache_data(ttl=3600)
-def get_db_stats():
-    if not DB_PATH.exists(): return None
-    with get_connection() as conn:
-        res = conn.execute("SELECT MIN(SUBSTR(report_timestamp, 1, 10)), MAX(SUBSTR(report_timestamp, 1, 10)), COUNT(DISTINCT SUBSTR(report_timestamp, 1, 10)) FROM stocks").fetchone()
-        return {"start": res[0], "end": res[1], "days_count": res[2]}
-
-@st.cache_data(ttl=3600)
-def load_anomalies() -> pd.DataFrame:
-    if not DB_PATH.exists(): return pd.DataFrame()
-    with get_connection() as conn:
-        cursor = conn.execute("SELECT DISTINCT SUBSTR(report_timestamp, 1, 10) FROM stocks ORDER BY 1 DESC LIMIT 2")
-        dates = [row[0] for row in cursor.fetchall()]
-        if len(dates) < 2: return pd.DataFrame()
-        
-        query = get_anomalies_query()
-        df = pd.read_sql_query(query, conn, params={"yesterday": dates[1], "today": dates[0]})
-        df.rename(columns={'sku': 'Артикул', 'item_name': 'Наименование', 'qty_old': 'Было', 'qty_new': 'Стало', 'delta': 'Дельта'}, inplace=True)
-        return df
-
-@st.cache_data(ttl=3600)
-def load_inventory() -> pd.DataFrame:
-    if not DB_PATH.exists(): return pd.DataFrame()
-    with get_connection() as conn:
-        latest_date = conn.execute("SELECT MAX(SUBSTR(report_timestamp, 1, 10)) FROM stocks").fetchone()[0]
-        
-        # Берем все данные как есть, без сложной SQL-логики
-        query = """
-            SELECT 
-                id as 'ID', 
-                sku as 'Артикул', 
-                item_name as 'Наименование', 
-                price as 'Цена', 
-                quantity as 'Остаток', 
-                category as 'Категория',
-                SUBSTR(report_timestamp, 1, 10) as 'last_seen_date',
-                report_timestamp
-            FROM stocks 
-        """
-        df = pd.read_sql_query(query, conn)
-        
-        if not df.empty:
-            # 1. Агрессивная нормализация для поиска дублей
-            # Убиваем двойные пробелы, неразрывные пробелы (\xa0), приводим всё в нижний регистр и меняем 'ё' на 'е'
-            df['norm_name'] = df['Наименование'].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True).str.lower().str.replace('ё', 'е')
-            df['norm_sku'] = df['Артикул'].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True).str.lower().str.replace('ё', 'е')
-            
-            # 2. Сортируем так, чтобы самые свежие записи оказались наверху
-            df = df.sort_values('report_timestamp', ascending=False)
-            
-            # 3. Удаляем дубликаты! Оставляем только самую первую (самую свежую) запись для каждого товара
-            df = df.drop_duplicates(subset=['norm_name', 'norm_sku'], keep='first')
-            
-            # 4. Проставляем статусы актуальности
-            df['actual'] = df['last_seen_date'] == latest_date
-            
-            # 5. Индекс для поиска (используем уже очищенные строки)
-            df['_search_index'] = df['norm_name'] + ' ' + df['norm_sku'] + ' ' + df['Категория'].fillna('').astype(str).str.lower()
-            
-            # Убираем технические колонки, чтобы они не вылезли в интерфейс
-            df = df.drop(columns=['report_timestamp', 'norm_name', 'norm_sku'])
-            
-        return df
-
-@st.cache_data(ttl=60) # Кэшируем на минуту, чтобы не дергать базу постоянно
-def load_anomaly_report(status="Открыта") -> pd.DataFrame:
-    if not DB_PATH.exists(): return pd.DataFrame()
-    with get_connection() as conn:
-        # Загружаем аномалии конкретного статуса
-        query = "SELECT * FROM anomaly_log WHERE status = :status ORDER BY detected_at DESC"
-        return pd.read_sql_query(query, conn, params={"status": status})
-
-
-@st.cache_data(ttl=3600)
-def load_dead_stock_analysis() -> pd.DataFrame:
-    if not DB_PATH.exists(): return pd.DataFrame()
-    with get_connection() as conn:
-        query = "SELECT SUBSTR(report_timestamp, 1, 10) as date, MAX(sku) as sku, category, item_name, price, quantity FROM stocks WHERE report_timestamp >= date('now', '-365 days') AND item_name IS NOT NULL GROUP BY date, item_name"
-        df = pd.read_sql_query(query, conn)
-        
-    if df.empty: return pd.DataFrame()
-    df['date'] = pd.to_datetime(df['date'])
-    current = df.sort_values(['item_name', 'date'], ascending=[True, False]).drop_duplicates('item_name').copy()
-    current = current[current['quantity'] > 0]
-    if current.empty: return pd.DataFrame()
-    
-    merged = df.merge(current[['item_name', 'quantity']], on='item_name', suffixes=('', '_curr'))
-    last_changes = merged[merged['quantity'] != merged['quantity_curr']].sort_values('date', ascending=False).drop_duplicates('item_name')[['item_name', 'date']].rename(columns={'date': 'last_change'})
-    res = current.merge(last_changes, on='item_name', how='left')
-    
-    first_seen = df.groupby('item_name')['date'].min().reset_index(name='first_seen')
-    res = res.merge(first_seen, on='item_name', how='left')
-    res['last_change'] = res['last_change'].fillna(res['first_seen'])
-    res.drop(columns=['first_seen'], inplace=True)
-    
-    res['Дней без движения'] = (res['date'] - res['last_change']).dt.days.fillna(0).astype(int)
-    res['Медиана категории'] = res.groupby('category')['Дней без движения'].transform('median')
-    res['Заморожен'] = res['Дней без движения'] > res['Медиана категории']
-    res.rename(columns={'sku': 'Артикул', 'item_name': 'Наименование', 'category': 'Категория', 'price': 'Цена', 'quantity': 'Остаток'}, inplace=True)
-    return res
-
-@st.cache_data(ttl=3600)
-def load_velocity_history(item_name: str, sku: str = "") -> pd.DataFrame:
-    if not DB_PATH.exists() or not item_name: return pd.DataFrame()
-    
-    # Вспомогательная функция, чтобы не дублировать код
-    def fetch_history_for_name(target_n, target_s=""):
-        safe_name = str(target_n).strip() if pd.notna(target_n) else ""
-        safe_sku = str(target_s).strip() if pd.notna(target_s) else ""
-        if safe_sku.lower() in ['nan', 'none', '<na>']: safe_sku = ""
-        
-        with get_connection() as conn:
-            first_word = safe_name.split()[0] if safe_name else ""
-            # ДОБАВЛЕНО: report_timestamp перед FROM
-            query = "SELECT item_name, sku, SUBSTR(report_timestamp, 1, 10) as 'Дата', quantity as 'Остаток', report_timestamp FROM stocks WHERE report_timestamp >= date('now', '-365 days') AND item_name LIKE :fw_pattern"
-            df = pd.read_sql_query(query, conn, params={"fw_pattern": f"{first_word}%"})
-            
-        if not df.empty:
-            df['clean_name'] = df['item_name'].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True).str.lower().str.replace('ё', 'е')
-            df['clean_sku'] = df['sku'].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True).str.lower().str.replace('ё', 'е')
-            tcn = pd.Series([safe_name]).str.strip().str.replace(r'\s+', ' ', regex=True).str.lower().str.replace('ё', 'е')[0]
-            tcs = pd.Series([safe_sku]).str.strip().str.replace(r'\s+', ' ', regex=True).str.lower().str.replace('ё', 'е')[0]
-            
-            mask = (df['clean_name'] == tcn)
-            if tcs: mask &= (df['clean_sku'] == tcs)
-            df = df[mask].copy()
-            
-            if not df.empty:
-                df = df.sort_values('report_timestamp', ascending=True).drop_duplicates(subset=['Дата'], keep='last')
-                df['Дата'] = pd.to_datetime(df['Дата'])
-                return df[['Дата', 'Остаток']].set_index('Дата')
-        return pd.DataFrame()
-
-    # 1. Загружаем историю текущего имени
-    combined_df = fetch_history_for_name(item_name, sku)
-    
-    # 2. Ищем алиасы (старые названия) в базе
-    with get_connection() as conn:
-        try:
-            aliases = conn.execute("SELECT old_name FROM item_aliases WHERE new_name = ?", (item_name,)).fetchall()
-        except sqlite3.OperationalError:
-            aliases = [] # Защита, если таблица еще не создалась
-            
-    # 3. Подгружаем историю старых названий и сшиваем с новой
-    for (old_name,) in aliases:
-        alias_df = fetch_history_for_name(old_name, "")
-        if not alias_df.empty:
-            combined_df = pd.concat([combined_df, alias_df]) if not combined_df.empty else alias_df
-            
-    # 4. Финальная очистка сшитого графика
-    if not combined_df.empty:
-        combined_df = combined_df.sort_index()
-        # Если в день смены названия есть оба остатка, оставляем самый свежий
-        combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
-        
-    return combined_df
-
-@st.cache_data(ttl=3600)
-def get_all_historical_items() -> dict:
-    """Выгружает все имена, артикулы и статусы актуальности за всю историю"""
-    if not DB_PATH.exists(): return {}
-    with get_connection() as conn:
-        # Получаем дату последнего парсинга (самую свежую в БД)
-        latest_db_date = conn.execute("SELECT MAX(SUBSTR(report_timestamp, 1, 10)) FROM stocks").fetchone()[0]
-
-        # Группируем, чтобы получить уникальные имена, их артикулы и дату последнего появления
-        query = """
-            SELECT item_name, MAX(sku) as sku, MAX(SUBSTR(report_timestamp, 1, 10)) as last_seen 
-            FROM stocks 
-            WHERE item_name != '' 
-            GROUP BY item_name
-        """
-        res = conn.execute(query).fetchall()
-        
-        # Формируем расширенный словарь данных
-        result = {}
-        for row in res:
-            name = row[0]
-            sku = row[1] if row[1] else "Без артикула"
-            last_seen = row[2]
-            # Если дата последней фиксации меньше сегодняшней, значит товар снят с сайта
-            is_active = (last_seen == latest_db_date) 
-            result[name] = {"sku": sku, "is_active": is_active, "last_seen": last_seen}
-            
-        return result
-
-def save_anomaly_to_db(data: dict):
-    """Записывает инцидент в базу и сбрасывает кэш для обновления экрана"""
-    with get_connection() as conn:
-        conn.execute(get_insert_anomaly_query(), data)
-        conn.commit()
-    st.cache_data.clear()
-
-def close_anomaly_in_db(anomaly_id: int, comment: str):
-    with get_connection() as conn:
-        conn.execute(get_close_anomaly_query(), {"id": anomaly_id, "comment": comment})
-        conn.commit()
-    st.cache_data.clear()
-
-def cancel_anomaly_in_db(anomaly_id: int, comment: str):
-    with get_connection() as conn:
-        conn.execute(get_cancel_anomaly_query(), {"id": anomaly_id, "comment": comment})
-        conn.commit()
-    st.cache_data.clear()
-
 # --- ЛОГИКА НАВИГАЦИИ ---
-df_inv = load_inventory()
-df_anomalies = load_anomalies()
-db_stats = get_db_stats()
+df_inv = db.load_inventory()
+df_anomalies = db.load_anomalies()
+db_stats = db.get_db_stats()
 
 # Фильтруем активные аномалии по именам
 active_anom_count = len(df_anomalies[~df_anomalies['Наименование'].isin(st.session_state.dismissed_names)]) if not df_anomalies.empty else 0
 
 # Безопасно считаем открытые задачи из базы
 try:
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         open_tasks_count = conn.execute("SELECT COUNT(*) FROM anomaly_log WHERE status = 'Открыта'").fetchone()[0]
 except Exception:
     open_tasks_count = 0
@@ -473,7 +258,7 @@ if st.session_state.current_page == "📦 Склад":
 
     # --- ЛОГИКА УМНЫХ БАННЕРОВ ---
     # Считаем задачи в базе
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         active_tasks = conn.execute("SELECT COUNT(*) FROM anomaly_log WHERE status = 'Открыта'").fetchone()[0]
     
     # Считаем свежие аномалии (используем уже загруженный датафрейм)
@@ -539,7 +324,7 @@ if st.session_state.current_page == "📦 Склад":
 
                 # ФИКСАЦИЯ УСПЕШНОЙ СВЕРКИ (Экономия похода в офис)
                 if btn_c[2].button("✅", key=f"ok_{row['ID']}", help="Остаток сошелся"):
-                    save_anomaly_to_db({
+                    db.save_anomaly_to_db({
                         "item_name": row['Наименование'],
                         "anomaly_type": "Успешная сверка",
                         "qty_system": row['Остаток'],
@@ -570,7 +355,7 @@ if st.session_state.current_page == "📦 Склад":
                         # Обнуляем ущерб, если это тест
                         impact = 0 if is_test else abs(row['Остаток'] - fact_qty) * row['Цена']
                         
-                        save_anomaly_to_db({
+                        db.save_anomaly_to_db({
                             "item_name": row['Наименование'],
                             "anomaly_type": anom_type,
                             "qty_system": row['Остаток'],
@@ -592,7 +377,7 @@ if st.session_state.current_page == "📦 Склад":
         st.write("---")
         st.subheader("🤖 Мониторинг парсера (Data Health)")
         
-        with get_connection() as conn:
+        with db.get_connection() as conn:
             # Запрос статистики за последние 3 дня
             query_stats = """
                 SELECT 
@@ -726,7 +511,7 @@ if st.session_state.current_page == "📦 Склад":
                                 
                             # КНОПКА 2: Ошибка витрины (Баг - пишем в KPI)
                             if btn_col2.button("🚨 Баг 1С", key=f"lost_bug_{row['ID']}", help="Товар лежит на полке, но сайт его скрыл!", type="primary", use_container_width=True):
-                                save_anomaly_to_db({
+                                db.save_anomaly_to_db({
                                     "item_name": row['Наименование'],
                                     "anomaly_type": "Скрыт с витрины (Баг)",
                                     "qty_system": 0, # На сайте 0 (его нет)
@@ -752,7 +537,7 @@ elif st.session_state.current_page == "⚠️ Аномалии":
         arrivals = active_anom[active_anom['Дельта'] > 0]
         
         if not arrivals.empty:
-            with get_connection() as conn:
+            with db.get_connection() as conn:
                 # Загружаем ожидаемые приходы
                 expected = pd.read_sql_query("SELECT * FROM expected_deliveries WHERE status = 'Ожидает'", conn)
                 
@@ -768,7 +553,7 @@ elif st.session_state.current_page == "⚠️ Аномалии":
                             match_id = match.iloc[0]['id']
                             
                             # Нашли! Сами легализуем аномалию
-                            save_anomaly_to_db({
+                            db.save_anomaly_to_db({
                                 "item_name": anom_row['Наименование'],
                                 "anomaly_type": "📦 Плановый приход",
                                 "qty_system": anom_row['Стало'],
@@ -879,7 +664,7 @@ elif st.session_state.current_page == "⚠️ Аномалии":
                                     "status": final_status, 
                                     "comment": auto_comment
                                 }
-                                save_anomaly_to_db(anomaly_data)
+                                db.save_anomaly_to_db(anomaly_data)
                                 st.session_state.dismissed_names.append(row['Наименование'])
                                 st.success(f"Зафиксировано: {label}")
                                 st.rerun()
@@ -891,7 +676,7 @@ elif st.session_state.current_page == "⚠️ Аномалии":
                     # Верхний ряд с кнопками пропуска и отмены (чтобы всегда были под рукой)
                     col_top1, col_top2 = st.columns([3, 1])
                     if col_top1.button("⏭️ Просто обновить карточку (БЕЗ склейки с историей)", key=f"skip_link_{idx}"):
-                        save_anomaly_to_db({
+                        db.save_anomaly_to_db({
                             "item_name": row['Наименование'],
                             "anomaly_type": "🔄 Обновление карточки",
                             "qty_system": row['Стало'],
@@ -969,7 +754,7 @@ elif st.session_state.current_page == "⚠️ Аномалии":
                             # Кнопка склейки прямо в строке товара!
                             if c[3].button("🔗 Склеить", key=f"do_link_{idx}_{matched_idx}", type="primary"):
                                 old_name = m_row['Наименование']
-                                with get_connection() as conn:
+                                with db.get_connection() as conn:
                                     conn.execute("INSERT INTO item_aliases (new_name, old_name) VALUES (?, ?)", (row['Наименование'], old_name))
                                     conn.execute("""
                                         INSERT INTO anomaly_log (detected_at, item_name, anomaly_type, qty_system, qty_physical, financial_impact, source, status, comment)
@@ -979,7 +764,7 @@ elif st.session_state.current_page == "⚠️ Аномалии":
                                 if old_name not in st.session_state.dismissed_names:
                                     st.session_state.dismissed_names.append(old_name)
 
-                                save_anomaly_to_db({
+                                db.save_anomaly_to_db({
                                     "item_name": row['Наименование'],
                                     "anomaly_type": "🔄 Обновление карточки",
                                     "qty_system": row['Стало'],
@@ -1005,7 +790,7 @@ elif st.session_state.current_page == "🎯 Эффективность":
     hc1.subheader("🎯 KPI: Эффективность и Качество (Lean Model)")
     include_tests = hc2.checkbox("🧪 Тестовые данные и баги", value=False, help="Показать тестовые записи для отладки")
     
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         # Добавляем status, detected_at и resolved_at для расчета MTTR
         query = """
             SELECT item_name, source, anomaly_type, status, detected_at, resolved_at 
@@ -1020,7 +805,7 @@ elif st.session_state.current_page == "🎯 Эффективность":
         st.info("Пока нет данных для расчета KPI.")
     else:
         # Получаем актуальный список неликвидов для сопоставления
-        df_dead = load_dead_stock_analysis()
+        df_dead = db.load_dead_stock_analysis()
         # Создаем словарь: Название -> Статус заморозки
         dead_map = dict(zip(df_dead['Наименование'], df_dead['Заморожен'])) if not df_dead.empty else {}
 
@@ -1101,7 +886,7 @@ elif st.session_state.current_page == "🎯 Эффективность":
         mttr_delta_color = "normal" if mttr_median <= S_MTTR_NORM else "inverse"
 
         # --- 6. РАСЧЕТ SLA COMPLIANCE RATE (ДОЛЯ В ВАЛЮТЕ ВРЕМЕНИ) ---
-        with get_connection() as conn:
+        with db.get_connection() as conn:
             # S_MTTR_NORM у нас задан выше (8.0 часов). Используем его, чтобы 
             # нормативы MTTR и SLA ссылались на одно и то же бизнес-правило.
             sla_df = pd.read_sql_query(get_sla_metrics_query(sla_hours=S_MTTR_NORM), conn)
@@ -1202,7 +987,7 @@ elif st.session_state.current_page == "🎯 Эффективность":
     st.subheader("👻 Уровень мерцания сайта (Ghosting Rate)")
     st.caption("Показывает количество товаров, которые вчера имели положительный остаток, а сегодня бесследно пропали с витрины.")
     
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         ghost_query = """
             WITH DailyStocks AS (
                 SELECT 
@@ -1240,7 +1025,7 @@ elif st.session_state.current_page == "🎯 Эффективность":
     st.write("**💸 Оценка упущенной выгоды (Risk Value Modeling)**")
 
     # 1. Запрашиваем из базы сумму ущерба всех зафиксированных багов 1С
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         bug_impact_query = "SELECT SUM(financial_impact) FROM anomaly_log WHERE anomaly_type = 'Скрыт с витрины (Баг)'"
         total_max_risk_result = conn.execute(bug_impact_query).fetchone()[0]
 
@@ -1275,7 +1060,7 @@ elif st.session_state.current_page == "🎯 Эффективность":
 
     # --- РАЗДЕЛ 1: SYSTEM IQ (Дневная динамика) ---
     st.subheader("🤖 System IQ (Daily Health & Intel)")
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         # Прячем тесты, если галочка не стоит
         iq_where = "" if include_tests else "WHERE anomaly_type != 'Тестовая запись'"
         
@@ -1333,7 +1118,7 @@ elif st.session_state.current_page == "🎯 Эффективность":
 
     # --- РАЗДЕЛ 2: FEATURE ADOPTION (Дневная динамика UX) ---
     st.subheader("🖱️ Feature Adoption (Ручная нагрузка на менеджера)")
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         # 3. ИСКЛЮЧАЕМ РАБОТУ ИИ ИЗ ЭТОГО ГРАФИКА (Здесь только ручные клики!)
         ad_where = "WHERE anomaly_type != 'Успешная сверка' AND IFNULL(comment, '') NOT LIKE '%[BUG]%' AND source != 'Автоматически (Нейро-приемка)'"
         if not include_tests:
@@ -1374,7 +1159,7 @@ elif st.session_state.current_page == "🎯 Эффективность":
     st.subheader("📜 История выявленных проблем (последние 50 записей)")
     st.caption("Здесь отображаются закрытые инциденты. Вы можете пометить ошибочные клики как баг системы.")
     
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         if include_tests:
             query = """
                 SELECT 
@@ -1449,7 +1234,7 @@ elif st.session_state.current_page == "🎯 Эффективность":
                 c[6].button("✅", key=f"bug_done_{row['id']}", disabled=True, help="Уже отмечено как баг")
             else:
                 if c[6].button("🚨", key=f"mark_bug_{row['id']}", help="Пометить как сбой интерфейса/системы"):
-                    with get_connection() as conn:
+                    with db.get_connection() as conn:
                         conn.execute("""
                             UPDATE anomaly_log 
                             SET comment = '[BUG] ' || IFNULL(comment, 'Ошибка классификации/UI') 
@@ -1460,7 +1245,7 @@ elif st.session_state.current_page == "🎯 Эффективность":
             
             # 8. КНОПКА ВОЗВРАТА В АНОМАЛИИ
             if c[7].button("↩️", key=f"restore_hist_{row['id']}", help="Отменить решение и вернуть в Аномалии"):
-                with get_connection() as conn:
+                with db.get_connection() as conn:
                     conn.execute("DELETE FROM anomaly_log WHERE id = ?", (row['id'],))
                     conn.commit()
                 if row['item_name'] in st.session_state.dismissed_names:
@@ -1475,7 +1260,7 @@ elif st.session_state.current_page == "🎯 Эффективность":
     st.subheader("🙈 Журнал рутины (Легализованные аномалии)")
     st.caption("Постоянная память: здесь хранится история плановых поступлений и успешных сверок.")
     
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         query_legal = """
             SELECT 
                 a.id, 
@@ -1529,7 +1314,7 @@ elif st.session_state.current_page == "🎯 Эффективность":
                 
             # 5. КНОПКА БАГА
             if c[4].button("🚨", key=f"leg_bug_{row['id']}", help="Ошибся кнопкой? Отправить в баги"):
-                with get_connection() as conn:
+                with db.get_connection() as conn:
                     conn.execute("""
                         UPDATE anomaly_log 
                         SET comment = '[BUG] ' || IFNULL(comment, 'Ошибочная легализация') 
@@ -1541,7 +1326,7 @@ elif st.session_state.current_page == "🎯 Эффективность":
             # --- НОВАЯ КНОПКА ВОЗВРАТА В АНОМАЛИИ ---
             if c[5].button("↩️", key=f"restore_leg_{row['id']}", help="Отменить решение и вернуть в Аномалии"):
                 # 1. Удаляем из базы (Очищаем KPI)
-                with get_connection() as conn:
+                with db.get_connection() as conn:
                     conn.execute("DELETE FROM anomaly_log WHERE id = ?", (row['id'],))
                     conn.commit()
                 # 2. Возвращаем на экран Аномалий
@@ -1557,7 +1342,7 @@ elif st.session_state.current_page == "🎯 Эффективность":
 elif st.session_state.current_page == "❄️ Неликвиды":
     st.subheader("❄️ Анализ замороженного капитала (Dead Stock)")
     
-    df_dead = load_dead_stock_analysis()
+    df_dead = db.load_dead_stock_analysis()
     
     if df_dead.empty: 
         st.info("📊 Нужно больше данных. Алгоритм выявления неликвидов заработает, когда накопится история изменений.")
@@ -1617,7 +1402,7 @@ elif st.session_state.current_page == "📈 Оборачиваемость":
             
         st.subheader(f"{target_name}")
         
-        history = load_velocity_history(target_name, target_sku)
+        history = db.load_velocity_history(target_name, target_sku)
         
         if len(history) < 2: 
             st.warning("Мало данных для годового графика. Нужно накопить хотя бы 2 среза базы.")
@@ -1666,12 +1451,12 @@ elif st.session_state.current_page == "📈 Оборачиваемость":
                 )
 
 elif st.session_state.current_page == "🔥 Задачи":
-    df_tasks = load_anomaly_report("Открыта") #
+    df_tasks = db.load_anomaly_report("Открыта") #
     
     if df_tasks.empty:
         st.success("Все задачи выполнены!")
     else:
-        latest_inv = load_inventory() #
+        latest_inv = db.load_inventory() #
         
         for idx, row in df_tasks.iterrows():
             with st.expander(f"📌 {row['item_name']} ({row['anomaly_type']})"):
@@ -1707,15 +1492,15 @@ elif st.session_state.current_page == "🔥 Задачи":
                     # Если это вина сайта, принудительно меняем тип аномалии
                     # Это исключит задачу из расчета MTTR
                     if close_reason == "Просто лаг сайта (Догруз данных)":
-                        with get_connection() as conn:
+                        with db.get_connection() as conn:
                             conn.execute("UPDATE anomaly_log SET anomaly_type = '⏳ Догруз с сайта' WHERE id = ?", (row['id'],))
                             conn.commit()
                             
-                    close_anomaly_in_db(row['id'], final_note)
+                    db.close_anomaly_in_db(row['id'], final_note)
                     st.rerun()
                 
                 if bc2.button("🗑️ Отменить запись", key=f"cancel_{row['id']}", use_container_width=True):
-                    cancel_anomaly_in_db(row['id'], final_note) 
+                    db.cancel_anomaly_in_db(row['id'], final_note) 
                     st.rerun()
 
 elif st.session_state.current_page == "📥 Приемка":
@@ -1795,7 +1580,7 @@ elif st.session_state.current_page == "📥 Приемка":
                 st.dataframe(df_result, use_container_width=True, hide_index=True)
                 
                 if st.button("💾 Подтвердить и сохранить в Ожидаемые приходы", type="primary"):
-                    with get_connection() as conn:
+                    with db.get_connection() as conn:
                         for item in st.session_state.temp_invoice:
                             try:
                                 qty = int(item.get('количество', 0))
@@ -1816,7 +1601,7 @@ elif st.session_state.current_page == "📥 Приемка":
     st.subheader("📋 Список ожидаемых товаров")
     st.caption("Эти позиции были оцифрованы и ждут появления на сайте для авто-легализации аномалий.")
     
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         # Вытаскиваем только те товары, которые еще не были легализованы
         expected_df = pd.read_sql_query(
             "SELECT id, created_at, sku, item_name, qty_expected FROM expected_deliveries WHERE status = 'Ожидает' ORDER BY created_at DESC", 
@@ -1851,7 +1636,7 @@ elif st.session_state.current_page == "📥 Приемка":
             
             # 5. Кнопка удаления (полностью удаляет строку из БД)
             if c[4].button("❌", key=f"del_exp_{row['id']}", help="Удалить позицию из листа ожидания"):
-                with get_connection() as conn:
+                with db.get_connection() as conn:
                     conn.execute("DELETE FROM expected_deliveries WHERE id = ?", (row['id'],))
                     conn.commit()
                 st.toast(f"🗑️ Товар удален из ожидания: {row['item_name']}")
@@ -1864,7 +1649,7 @@ elif st.session_state.current_page == "⚖️ A/B Тест: AI vs Человек
     st.caption("Теневой режим работы: алгоритм делает прогнозы закупок и сверяет их с реальными действиями менеджеров. Это позволяет оценить упущенную выгоду без вмешательства в текущие бизнес-процессы.")
     
     # --- ИНДИКАТОР ПРОГРЕВА МОДЕЛИ (COLD START) ---
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         # Считаем, сколько дней истории у нас есть
         days_in_db_query = "SELECT COUNT(DISTINCT SUBSTR(report_timestamp, 1, 10)) FROM stocks"
         days_in_db = conn.execute(days_in_db_query).fetchone()[0]
@@ -1877,7 +1662,7 @@ elif st.session_state.current_page == "⚖️ A/B Тест: AI vs Человек
     # 1. Запускаем фоновую проверку прогнозов при входе на вкладку
     verify_shadow_forecasts()
     
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         # Подтягиваем прогнозы + актуальный остаток прямо из таблицы stocks
         df_forecasts = pd.read_sql_query("""
             SELECT 
@@ -1935,7 +1720,7 @@ elif st.session_state.current_page == "⚖️ A/B Тест: AI vs Человек
     pending_flag = Path("logs/ai_pending.flag")
     
     # 1. Считаем прогнозы за сегодня для понимания статуса
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(db.DB_PATH) as conn:
          forecasts_today = conn.execute("SELECT COUNT(*) FROM ai_forecasts WHERE date(created_at) = date('now', 'localtime')").fetchone()[0]
 
     # 2. Информационные уведомления
