@@ -4,6 +4,7 @@ import pandas as pd
 from pathlib import Path
 import sqlite3
 import db
+import ai_services
 from contextlib import contextmanager
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -11,18 +12,6 @@ from queries import get_anomalies_query, get_insert_anomaly_query, get_close_ano
 
 import math
 
-@st.cache_data(ttl=60, show_spinner=False)
-def check_gemini_connection():
-    import requests
-    try:
-        proxies = {
-            "http": "socks5://127.0.0.1:1080",
-            "https": "socks5://127.0.0.1:1080"
-        }
-        requests.get("https://generativelanguage.googleapis.com", timeout=1.5)
-        return True
-    except:
-        return False
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
@@ -279,7 +268,7 @@ if st.session_state.current_page == "📦 Склад":
     # --- ГЛОБАЛЬНАЯ СИСТЕМА УВЕДОМЛЕНИЙ ОБ ОТЛОЖЕННОМ ИИ ---
     pending_flag = Path("logs/ai_pending.flag")
     if pending_flag.exists():
-        is_proxy_ok = check_gemini_connection()
+        is_proxy_ok = ai_services.check_gemini_connection()
         if not is_proxy_ok:
             st.error("🚨 **Системное предупреждение:** Парсер собрал новые данные, но ИИ-прогнозы не построены (нет связи с Gemini API). **Пожалуйста, включите VPN/Прокси!**")
         else:
@@ -1506,96 +1495,50 @@ elif st.session_state.current_page == "🔥 Задачи":
 elif st.session_state.current_page == "📥 Приемка":
     st.subheader("📸 Оцифровка накладной (Нейро-приемка)")
     st.caption("Загрузите фото таблицы с товарами. Цены и контрагентов в кадр брать не нужно.")
-    
-
-    from google import genai 
-    from PIL import Image
-    import json
-    import os
-    
-    api_key = st.secrets["GEMINI_API_KEY"]
-    
-    if api_key:
-
-        os.environ['HTTPS_PROXY'] = "socks5://127.0.0.1:1080"
-        os.environ['HTTP_PROXY'] = "socks5://127.0.0.1:1080"
-
-
-        client = genai.Client(api_key=api_key)
         
-        # Оставляем только загрузку из галереи по твоей просьбе
-        file_photo = st.file_uploader("📂 Выберите фото из галереи (накладная):", type=["jpg", "jpeg", "png"])
+    # Оставляем только загрузку из галереи по твоей просьбе
+    file_photo = st.file_uploader("📂 Выберите фото из галереи (накладная):", type=["jpg", "jpeg", "png"])
+    
+    if file_photo:
+        st.image(file_photo, caption="📸 Фото загружено", width=400)
         
-        if file_photo:
-            st.image(file_photo, caption="📸 Фото загружено", width=400)
-            
-            if st.button("🚀 Отправить на оцифровку", type="primary", use_container_width=True):
-                with st.spinner("🧠 Нейросеть Gemini читает таблицу..."):
-                    try:
-                        img = Image.open(file_photo)
-                        
-                        # Строгий промпт
-                        prompt = """
-                        Ты — точный алгоритм оцифровки документов. 
-                        На этой картинке таблица с товарами (накладная). 
-                        
-                        ТВОЯ ЗАДАЧА:
-                        Извлечь данные из ячеек "Артикул", "Товары" и "Кол-во" СТРОГО 1 в 1 как напечатано на бумаге.
-                        
-                        ПРАВИЛА:
-                        1. Название: Перепиши весь текст ячейки полностью. Обязательно сохраняй все скобки, размеры и приписки (например, "(L=53мм) - рычаг (10/100шт.)"). Ничего не сокращай!
-                        2. Артикул: Перепиши всё содержимое ячейки. Если там есть название бренда (например, "Джакомини Рус") или перенос строки, склей это в одну строку и сохрани. Не обрезай текст!
-                        3. Количество: Верни только цифру.
-                        
-                        ВЕРНИ СТРОГО МАССИВ JSON И БОЛЬШЕ НИЧЕГО. 
-                        Формат:
-                        [
-                          {"название": "Кран шаровый латунный... (L=53мм) - рычаг...", "артикул": "R850X023 Джакомини Рус", "количество": 100}
-                        ]
-                        """
-                        
-                        # Вызов через новый SDK и модель 3.1 Flash Lite
-                        response = client.models.generate_content(
-                            model="gemini-2.5-flash",
-                            contents=[prompt, img]
-                        )
-                        
-                        # Очистка текста от маркдауна и парсинг
-                        raw_text = response.text.replace("```json", "").replace("```", "").strip()
-                        items_list = json.loads(raw_text)
-                        
-                        st.success(f"✅ Распознано позиций: {len(items_list)}")
-                        st.session_state.temp_invoice = items_list
-                        
-                    except Exception as e:
-                        st.error(f"❌ Ошибка распознавания: {e}")
-                        st.info("💡 Убедитесь, что Bitvise SSH (прокси) залогинен и работает на ноутбуке.")
-            
-            # Блок сохранения результата
-            if 'temp_invoice' in st.session_state:
-                st.write("---")
-                st.write("**Результат оцифровки:**")
-                df_result = pd.DataFrame(st.session_state.temp_invoice)
-                
-                st.dataframe(df_result, use_container_width=True, hide_index=True)
-                
-                if st.button("💾 Подтвердить и сохранить в Ожидаемые приходы", type="primary"):
-                    with db.get_connection() as conn:
-                        for item in st.session_state.temp_invoice:
-                            try:
-                                qty = int(item.get('количество', 0))
-                            except (ValueError, TypeError):
-                                qty = 0
-                                
-                            conn.execute("""
-                                INSERT INTO expected_deliveries (item_name, sku, qty_expected) 
-                                VALUES (?, ?, ?)
-                            """, (str(item.get('название', '')), str(item.get('артикул', '')), qty))
-                        conn.commit()
+        if st.button("🚀 Отправить на оцифровку", type="primary", use_container_width=True):
+            with st.spinner("🧠 Нейросеть Gemini читает таблицу..."):
+                try:
+                    items_list = ai_services.digitize_invoice(file_photo)
                     
-                    del st.session_state.temp_invoice
-                    st.success("🎉 Данные успешно добавлены в список ожидания!")
-                    st.rerun()
+                    st.success(f"✅ Распознано позиций: {len(items_list)}")
+                    st.session_state.temp_invoice = items_list
+                    
+                except Exception as e:
+                    st.error(f"❌ Ошибка распознавания: {e}")
+                    st.info("💡 Убедитесь, что Bitvise SSH (прокси) залогинен и работает на ноутбуке.")
+        
+        # Блок сохранения результата
+        if 'temp_invoice' in st.session_state:
+            st.write("---")
+            st.write("**Результат оцифровки:**")
+            df_result = pd.DataFrame(st.session_state.temp_invoice)
+            
+            st.dataframe(df_result, use_container_width=True, hide_index=True)
+            
+            if st.button("💾 Подтвердить и сохранить в Ожидаемые приходы", type="primary"):
+                with db.get_connection() as conn:
+                    for item in st.session_state.temp_invoice:
+                        try:
+                            qty = int(item.get('количество', 0))
+                        except (ValueError, TypeError):
+                            qty = 0
+                            
+                        conn.execute("""
+                            INSERT INTO expected_deliveries (item_name, sku, qty_expected) 
+                            VALUES (?, ?, ?)
+                        """, (str(item.get('название', '')), str(item.get('артикул', '')), qty))
+                    conn.commit()
+                
+                del st.session_state.temp_invoice
+                st.success("🎉 Данные успешно добавлены в список ожидания!")
+                st.rerun()
             
     st.divider()
     st.subheader("📋 Список ожидаемых товаров")
@@ -1740,8 +1683,7 @@ elif st.session_state.current_page == "⚖️ A/B Тест: AI vs Человек
     if st.button(btn_text, type=btn_type, use_container_width=True):
         with st.spinner("🤖 ИИ анализирует графики продаж..."):
             try:
-                from ai_forecaster import run_batch_forecast
-                status = run_batch_forecast()
+                status = ai_services.run_batch_forecast()
                 
                 if status == "no_key":
                     st.error("❌ Не найден API ключ Gemini!")
