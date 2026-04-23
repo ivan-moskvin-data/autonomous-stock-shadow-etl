@@ -269,11 +269,11 @@ if st.session_state.current_page == "📦 Склад":
     # --- ГЛОБАЛЬНАЯ СИСТЕМА УВЕДОМЛЕНИЙ ОБ ОТЛОЖЕННОМ ИИ ---
     pending_flag = Path("logs/ai_pending.flag")
     if pending_flag.exists():
-        is_proxy_ok = ai_services.check_gemini_connection()
+        is_proxy_ok = ai_services.check_ai_connection()
         if not is_proxy_ok:
-            st.error("🚨 **Системное предупреждение:** Парсер собрал новые данные, но ИИ-прогнозы не построены (нет связи с Gemini API). **Пожалуйста, включите VPN/Прокси!**")
+            st.error("🚨 **Системное предупреждение:** Парсер собрал новые данные, но ИИ-прогнозы не построены (нет связи с OpenRouter API).")
         else:
-            st.warning("⚠️ **ИИ ожидает запуска:** В системе есть свежие не проанализированные данные. Включите прокси, перейдите на вкладку '⚖️ A/B Тест' и нажмите кнопку запуска.")
+            st.warning("⚠️ **ИИ ожидает запуска:** В системе есть свежие не проанализированные данные. Перейдите на вкладку '⚖️ A/B Тест' и нажмите кнопку запуска.")
 
     st.write("---")
     
@@ -915,7 +915,7 @@ elif st.session_state.current_page == "📥 Приемка":
                     
                 except Exception as e:
                     st.error(f"❌ Ошибка распознавания: {e}")
-                    st.info("💡 Убедитесь, что Bitvise SSH (прокси) залогинен и работает на ноутбуке.")
+                    
         
         # Блок сохранения результата
         if 'temp_invoice' in st.session_state:
