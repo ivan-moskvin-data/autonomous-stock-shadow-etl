@@ -5,7 +5,7 @@ ab_test_view.py — NiceGUI-версия вкладки «A/B Тест: AI vs Ч
 verify_shadow_forecasts() инлайнована напрямую (circular import app.py невозможен).
 ai_services.run_batch_forecast() вызывается через run.io_bound().
 """
-from nicegui import ui, run
+from nicegui import ui, run as ng_run
 import sys
 import os
 import logging
@@ -356,11 +356,10 @@ def setup_page():
                     ui.aggrid({
                         'columnDefs':         col_defs,
                         'rowData':            disp.to_dict('records'),
-                        'domLayout':          'autoHeight',
                         'defaultColDef':      {'resizable': True},
                         'pagination':         True,
                         'paginationPageSize': 15,
-                    }).classes('w-full ag-theme-balham-dark')
+                    }).classes('w-full ag-theme-balham-dark').style('height:500px;')
 
                 ui.separator().style('background:#2a2a2a;')
 
@@ -400,7 +399,7 @@ def setup_page():
                     status_lbl.set_text('🤖 ИИ анализирует графики продаж…')
                     status_lbl.set_visibility(True)
                     try:
-                        result = await run.io_bound(ai_services.run_batch_forecast)
+                        result = await ng_run.io_bound(ai_services.run_batch_forecast)
 
                         if result == 'no_key':
                             ui.notify('❌ Не найден API ключ Gemini!', type='negative', timeout=0)
@@ -416,7 +415,7 @@ def setup_page():
                             ui.notify(f'✅ Готово! Сгенерировано прогнозов: {count}.', type='positive')
                             if _AI_PENDING_FLAG.exists():
                                 _AI_PENDING_FLAG.unlink()
-                            render_main.refresh()
+                            await render_main.refresh()
                         else:
                             ui.notify(f'Результат: {result}', type='info')
 
@@ -431,4 +430,5 @@ def setup_page():
                     .props(f'color={btn_color} no-caps') \
                     .classes('w-full')
 
-            render_main()
+            await render_main()
+
