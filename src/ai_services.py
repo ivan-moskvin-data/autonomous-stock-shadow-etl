@@ -3,6 +3,7 @@ import json
 import time
 import logging
 import sqlite3
+import statistics
 import tomllib
 import pandas as pd
 import requests
@@ -133,21 +134,63 @@ def run_batch_forecast():
             batch = active_items.iloc[i:i+batch_size]
             items_data = []
             for _, row in batch.iterrows():
-                df_hist = pd.read_sql_query(f"SELECT SUBSTR(report_timestamp, 1, 10) as date, quantity FROM stocks WHERE item_name = ? AND report_timestamp >= date('now', '-{history_days} days')", conn, params=(row['item_name'],))
-                sales = float(df_hist['quantity'].max() - df_hist['quantity'].min())
-                days_tracked = max(1, (pd.to_datetime(df_hist['date']).max() - pd.to_datetime(df_hist['date']).min()).days) if len(df_hist) > 1 else 1
-                avg_sales = round(sales / days_tracked, 2)
+                # Берём последний остаток за каждый день (дедуплицируем внутридневные записи)
+                df_hist = pd.read_sql_query(f"""
+                    SELECT
+                        SUBSTR(report_timestamp, 1, 10) AS date,
+                        quantity
+                    FROM stocks
+                    WHERE item_name = ?
+                      AND report_timestamp >= date('now', '-{history_days} days')
+                    GROUP BY SUBSTR(report_timestamp, 1, 10)
+                    HAVING report_timestamp = MAX(report_timestamp)
+                    ORDER BY date ASC
+                """, conn, params=(row['item_name'],))
+
+                # --- КОРРЕКТНЫЙ РАСЧЁТ avg_sales ЧЕРЕЗ ДНЕВНЫЕ ДЕЛЬТЫ ---
+                # Логика: если остаток уменьшился с вчера на сегодня — это продажи.
+                #         если остаток увеличился — это поставка (не считаем как продажи).
+                # Это корректно отделяет продажи от приходов товара.
+                if len(df_hist) > 1:
+                    quantities = df_hist['quantity'].tolist()
+                    daily_sales_list = []
+                    for j in range(1, len(quantities)):
+                        delta = quantities[j] - quantities[j - 1]
+                        if delta < 0:
+                            # Остаток уменьшился — это продажи
+                            daily_sales_list.append(abs(delta))
+                        # delta > 0 → поставка, пропускаем
+                        # delta == 0 → нет движения, пропускаем
+
+                    if daily_sales_list:
+                        # Среднее по дням с продажами, но делим на все дни (включая нулевые)
+                        # чтобы учитывать дни без движения товара
+                        days_tracked = max(1, len(df_hist) - 1)
+                        avg_sales = round(sum(daily_sales_list) / days_tracked, 2)
+                    else:
+                        # Нет ни одного дня со снижением остатка — скорее всего новый товар
+                        avg_sales = 0.0
+                else:
+                    # Только одна точка данных — не можем считать дельты
+                    avg_sales = 0.0
+                    days_tracked = 1
                 
                 # --- МАТЕМАТИЧЕСКИЙ РАСЧЁТ ПРОГНОЗА ---
                 current_qty = int(row['current_qty'])
                 lead_time = CONFIG['ai']['lead_time_days']
                 z = CONFIG['ai']['safety_stock_multiplier']
                 
-                # Расчёт std_dev по историческим остаткам
-                std_dev = float(df_hist['quantity'].std()) if len(df_hist) > 1 else 0.0
-                
+                # std_dev считаем по дневным продажам (не по остаткам!).
+                # Std по остаткам раздувается из-за поставок и даёт неверный страховой запас.
+                if len(daily_sales_list) >= 2:
+                    std_dev = statistics.stdev(daily_sales_list)
+                elif len(daily_sales_list) == 1:
+                    std_dev = daily_sales_list[0] * 0.2  # условная волатильность 20%
+                else:
+                    std_dev = 0.0
+
                 # Fallback: если данных мало, используем 20% от среднего расхода
-                if len(df_hist) < 3 or std_dev == 0:
+                if len(daily_sales_list) < 3 or std_dev == 0:
                     safety_stock = int(avg_sales * 0.2)
                 else:
                     # Страховой запас: z × σ × sqrt(lead_time)
