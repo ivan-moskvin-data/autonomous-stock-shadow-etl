@@ -196,11 +196,24 @@ def run_batch_forecast():
                     # Страховой запас: z × σ × sqrt(lead_time)
                     safety_stock = int(z * std_dev * (lead_time ** 0.5))
                 
-                # Базовый спрос за период поставки
-                base_demand = current_qty + int(avg_sales * lead_time)
-                
-                # Итоговый заказ
-                recommended_qty = base_demand + safety_stock
+                # ── Стандартная формула закупок (ROP — Reorder Point) ──────────
+                #
+                # ROP = сколько товара нужно иметь в момент размещения заказа,
+                #       чтобы покрыть потребность за время поставки + страховой запас.
+                #
+                #   ROP = avg_sales × lead_time + safety_stock
+                #
+                # Сколько заказать = ROP - текущий_остаток (если остаток ниже ROP).
+                # Если текущий остаток уже выше ROP — заказывать не нужно (= 0).
+                #
+                # Пример: avg=10/день, lead=14дн, safety=15, остаток=50
+                #   ROP = 10×14 + 15 = 155
+                #   order = 155 - 50 = 105 шт  ← корректный заказ
+                #
+                # Старая формула давала: 50 + 10×14 + 15 = 205 шт  ← завышена вдвое
+
+                reorder_point = int(avg_sales * lead_time) + safety_stock
+                recommended_qty = max(0, reorder_point - current_qty)
                 
                 # Дни до нуля (математически, без LLM)
                 days_to_zero = round(current_qty / avg_sales, 1) if avg_sales > 0 else 999.0
@@ -212,6 +225,7 @@ def run_batch_forecast():
                     "avg_sales": avg_sales,
                     "lead_time": lead_time,
                     "safety_stock": safety_stock,
+                    "reorder_point": reorder_point,
                     "recommended_qty": recommended_qty,
                     "days_to_zero": days_to_zero
                 })
@@ -232,8 +246,13 @@ def run_batch_forecast():
                     # Fallback: генерируем reason шаблонно, если LLM не отвечает
                     forecasts = []
                     for item in items_data:
-                        reason = f"Расчёт: {item['stock']} / {item['avg_sales']:.2f} = {item['days_to_zero']:.1f} дней. " \
-                                 f"Заказ: {item['stock']} + {int(item['avg_sales'] * item['lead_time'])} + {item['safety_stock']} шт."
+                        rop = int(item['avg_sales'] * item['lead_time']) + item['safety_stock']
+                        reason = (
+                            f"Расход: {item['avg_sales']:.2f} шт/день. "
+                            f"Хватит на: {item['days_to_zero']:.1f} дней. "
+                            f"ROP = {int(item['avg_sales'])} × {item['lead_time']} + {item['safety_stock']} = {rop} шт. "
+                            f"Заказать: max(0, {rop} - {item['stock']}) = {item['recommended_qty']} шт."
+                        )
                         forecasts.append({
                             "item_name": item['name'],
                             "sku": item['sku'],
@@ -256,8 +275,8 @@ def run_batch_forecast():
                                 lead_time_days = ?, safety_stock = ?, base_demand = ?, status = '⏳ Наблюдение' 
                             WHERE id = ?
                         """, (calc_zero_date, item_data['recommended_qty'], f['reason'], avg_s, 
-                              item_data['lead_time'], item_data['safety_stock'], 
-                              item_data['recommended_qty'] - item_data['safety_stock'], existing[0]))
+                              item_data['lead_time'], item_data['safety_stock'],
+                              item_data['reorder_point'], existing[0]))
                     else:
                         conn.execute("UPDATE ai_forecasts SET status = '🔄 Пересчитан ИИ' WHERE item_name = ? AND status = '⏳ Наблюдение'", (f['item_name'],))
                         conn.execute("""
@@ -266,8 +285,8 @@ def run_batch_forecast():
                              lead_time_days, safety_stock, base_demand) 
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (f['item_name'], f['sku'], calc_zero_date, item_data['recommended_qty'], 
-                              f['reason'], avg_s, item_data['lead_time'], item_data['safety_stock'], 
-                              item_data['recommended_qty'] - item_data['safety_stock']))
+                              f['reason'], avg_s, item_data['lead_time'], item_data['safety_stock'],
+                              item_data['reorder_point']))
                 conn.commit()
                 success_count += len(forecasts)
                 time.sleep(2)
