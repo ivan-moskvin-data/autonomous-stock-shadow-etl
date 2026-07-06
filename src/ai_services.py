@@ -231,65 +231,126 @@ def run_batch_forecast():
                 })
 
             today_date = pd.Timestamp.now().strftime('%Y-%m-%d')
-            # LLM теперь только для генерации обоснования (reason)
-            prompt = f"Сегодня: {today_date}. ДАННЫЕ: {json.dumps(items_data, ensure_ascii=False)}. " \
-                     f"ПРАВИЛА: 1. 'reason' — краткое обоснование прогноза на основе математических расчётов. " \
-                     f"ВЕРНИ JSON: [ {{\"item_name\": \"...\", \"sku\": \"...\", \"reason\": \"...\"}} ]"
-            
-            payload = {"model": CONFIG['ai']['model_forecast'], "messages": [{"role": "user", "content": prompt}], "temperature": CONFIG['ai']['temperature']}
-            
-            for attempt in range(CONFIG['crawler']['retry_count']):
+            # LLM используется только для генерации текстового обоснования (reason).
+            # Вся математика (avg_sales, ROP, recommended_qty) уже посчитана выше.
+            prompt = (
+                f"Сегодня: {today_date}. ДАННЫЕ: {json.dumps(items_data, ensure_ascii=False)}. "
+                f"ПРАВИЛА: 1. 'reason' — краткое обоснование прогноза на основе математических расчётов. "
+                f"ВЕРНИ JSON: [ {{\"item_name\": \"...\", \"sku\": \"...\", \"reason\": \"...\"}} ]"
+            )
+            payload = {
+                "model": CONFIG['ai']['model_forecast'],
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": CONFIG['ai']['temperature'],
+            }
+
+            retry_count = CONFIG['crawler'].get('retry_count', 3)
+            forecasts = None
+            llm_used = False
+
+            for attempt in range(retry_count):
                 try:
                     raw_text = call_openrouter(payload)
-                    forecasts = json.loads(raw_text.replace("```json", "").replace("```", "").strip())
+                    forecasts = json.loads(
+                        raw_text.replace("```json", "").replace("```", "").strip()
+                    )
+                    llm_used = True
+                    break  # ← только здесь, после успешного парсинга ответа LLM
+
                 except Exception as e:
-                    # Fallback: генерируем reason шаблонно, если LLM не отвечает
-                    forecasts = []
-                    for item in items_data:
-                        rop = int(item['avg_sales'] * item['lead_time']) + item['safety_stock']
-                        reason = (
-                            f"Расход: {item['avg_sales']:.2f} шт/день. "
-                            f"Хватит на: {item['days_to_zero']:.1f} дней. "
-                            f"ROP = {int(item['avg_sales'])} × {item['lead_time']} + {item['safety_stock']} = {rop} шт. "
-                            f"Заказать: max(0, {rop} - {item['stock']}) = {item['recommended_qty']} шт."
-                        )
-                        forecasts.append({
-                            "item_name": item['name'],
-                            "sku": item['sku'],
-                            "reason": reason
-                        })
-                
+                    wait_sec = 2 ** (attempt + 1)  # 2, 4, 8 секунд
+                    logging.warning(
+                        f"[AI] Попытка {attempt + 1}/{retry_count} не удалась: {e}. "
+                        f"Повтор через {wait_sec}с..."
+                    )
+                    if attempt < retry_count - 1:
+                        time.sleep(wait_sec)
+
+            if forecasts is None:
+                # Все попытки исчерпаны — используем шаблонный reason, но логируем
+                logging.warning(
+                    f"[AI] LLM недоступен после {retry_count} попыток. "
+                    f"Используем шаблонный reason для {len(items_data)} товаров."
+                )
+                forecasts = []
+                for item in items_data:
+                    rop = int(item['avg_sales'] * item['lead_time']) + item['safety_stock']
+                    reason = (
+                        f"[Авто] Расход: {item['avg_sales']:.2f} шт/день. "
+                        f"Хватит на: {item['days_to_zero']:.1f} дней. "
+                        f"ROP = {int(item['avg_sales'])} × {item['lead_time']} + {item['safety_stock']} = {rop} шт. "
+                        f"Заказать: max(0, {rop} - {item['stock']}) = {item['recommended_qty']} шт."
+                    )
+                    forecasts.append({
+                        "item_name": item['name'],
+                        "sku": item['sku'],
+                        "reason": reason,
+                    })
+
+            # ── Запись в БД (один раз за батч, после получения forecasts) ────────
+            try:
                 for f in forecasts:
-                    item_data = next((item for item in items_data if item['name'] == f['item_name']), None)
-                    if not item_data: continue
-                    
+                    item_data = next(
+                        (item for item in items_data if item['name'] == f['item_name']),
+                        None
+                    )
+                    if not item_data:
+                        continue
+
                     avg_s = item_data['avg_sales']
                     days_to_zero = item_data['days_to_zero']
-                    calc_zero_date = (pd.Timestamp.now() + pd.Timedelta(days=int(days_to_zero))).strftime('%Y-%m-%d')
-                    
-                    existing = conn.execute("SELECT id FROM ai_forecasts WHERE item_name = ? AND date(created_at) = date('now', 'localtime')", (f['item_name'],)).fetchone()
+                    calc_zero_date = (
+                        pd.Timestamp.now() + pd.Timedelta(days=int(days_to_zero))
+                    ).strftime('%Y-%m-%d')
+
+                    existing = conn.execute(
+                        "SELECT id FROM ai_forecasts "
+                        "WHERE item_name = ? AND date(created_at) = date('now', 'localtime')",
+                        (f['item_name'],)
+                    ).fetchone()
+
                     if existing:
                         conn.execute("""
-                            UPDATE ai_forecasts 
-                            SET predicted_zero_date = ?, recommended_qty = ?, reason = ?, avg_daily_sales = ?, 
-                                lead_time_days = ?, safety_stock = ?, base_demand = ?, status = '⏳ Наблюдение' 
+                            UPDATE ai_forecasts
+                            SET predicted_zero_date = ?, recommended_qty = ?, reason = ?,
+                                avg_daily_sales = ?, lead_time_days = ?, safety_stock = ?,
+                                base_demand = ?, status = '⏳ Наблюдение'
                             WHERE id = ?
-                        """, (calc_zero_date, item_data['recommended_qty'], f['reason'], avg_s, 
-                              item_data['lead_time'], item_data['safety_stock'],
-                              item_data['reorder_point'], existing[0]))
+                        """, (
+                            calc_zero_date, item_data['recommended_qty'], f['reason'],
+                            avg_s, item_data['lead_time'], item_data['safety_stock'],
+                            item_data['reorder_point'], existing[0]
+                        ))
                     else:
-                        conn.execute("UPDATE ai_forecasts SET status = '🔄 Пересчитан ИИ' WHERE item_name = ? AND status = '⏳ Наблюдение'", (f['item_name'],))
+                        conn.execute(
+                            "UPDATE ai_forecasts SET status = '🔄 Пересчитан ИИ' "
+                            "WHERE item_name = ? AND status = '⏳ Наблюдение'",
+                            (f['item_name'],)
+                        )
                         conn.execute("""
-                            INSERT INTO ai_forecasts 
-                            (item_name, sku, predicted_zero_date, recommended_qty, reason, avg_daily_sales, 
-                             lead_time_days, safety_stock, base_demand) 
+                            INSERT INTO ai_forecasts
+                            (item_name, sku, predicted_zero_date, recommended_qty, reason,
+                             avg_daily_sales, lead_time_days, safety_stock, base_demand)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (f['item_name'], f['sku'], calc_zero_date, item_data['recommended_qty'], 
-                              f['reason'], avg_s, item_data['lead_time'], item_data['safety_stock'],
-                              item_data['reorder_point']))
+                        """, (
+                            f['item_name'], f['sku'], calc_zero_date,
+                            item_data['recommended_qty'], f['reason'],
+                            avg_s, item_data['lead_time'], item_data['safety_stock'],
+                            item_data['reorder_point']
+                        ))
+
                 conn.commit()
                 success_count += len(forecasts)
-                time.sleep(2)
-                break
-                
+                logging.info(
+                    f"[AI] Батч сохранён: {len(forecasts)} прогнозов "
+                    f"({'LLM' if llm_used else 'шаблон'})."
+                )
+
+            except Exception as db_err:
+                logging.error(f"[AI] Ошибка записи в БД: {db_err}")
+                return f"error_{db_err}"
+
+            time.sleep(2)
+
     return f"ok_{success_count}"
+
