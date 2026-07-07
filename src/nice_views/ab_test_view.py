@@ -191,6 +191,193 @@ def _fmt_rub(val) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Оценка точности прогнозов
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _check_forecast_accuracy() -> None:
+    """
+    Проверяет точность прогнозов, у которых прошло достаточно времени.
+
+    Алгоритм:
+    1. Берём прогнозы в статусе '⏳ Наблюдение' или '🔴 Товар отсутствует',
+       созданные более lead_time_days дней назад (прошло достаточно времени).
+    2. Смотрим что реально произошло с остатком товара после даты прогноза:
+       - Если остаток достиг 0 в пределах ±TOLERANCE_DAYS от predicted_zero_date
+         → '✅ Точный прогноз'
+       - Если прогноз предсказывал обнуление, но товар всё ещё есть и дата
+         уже прошла → '📉 Упущенная выгода' (прогноз был верен, но не купили вовремя)
+       - Иначе оставляем текущий статус (наблюдаем дальше)
+    """
+    TOLERANCE_DAYS = 3  # ±3 дня — «точный прогноз»
+
+    try:
+        config = db.CONFIG
+        lead_time = config['ai']['lead_time_days']
+
+        with db.get_connection() as conn:
+            forecasts = pd.read_sql_query(f"""
+                SELECT id, item_name, sku, predicted_zero_date, avg_daily_sales,
+                       created_at, status
+                FROM ai_forecasts
+                WHERE status IN ('⏳ Наблюдение', '🔴 Товар отсутствует')
+                  AND date(created_at, '+{lead_time} days') <= date('now', 'localtime')
+                  AND predicted_zero_date IS NOT NULL
+            """, conn)
+
+            if forecasts.empty:
+                return
+
+            for _, row in forecasts.iterrows():
+                item_name   = row['item_name']
+                pred_date   = pd.to_datetime(row['predicted_zero_date'], errors='coerce')
+                created_at  = pd.to_datetime(row['created_at'], errors='coerce')
+                db_id       = row['id']
+                avg_sales   = float(row['avg_daily_sales'] or 0)
+
+                if pd.isna(pred_date) or pd.isna(created_at):
+                    continue
+
+                # Берём историю остатков после даты прогноза
+                window_start = created_at.strftime('%Y-%m-%d')
+                window_end   = (pred_date + pd.Timedelta(days=TOLERANCE_DAYS + 5)).strftime('%Y-%m-%d')
+
+                hist = pd.read_sql_query("""
+                    SELECT SUBSTR(report_timestamp, 1, 10) AS date, quantity
+                    FROM stocks
+                    WHERE item_name = ?
+                      AND SUBSTR(report_timestamp, 1, 10) BETWEEN ? AND ?
+                    GROUP BY SUBSTR(report_timestamp, 1, 10)
+                    HAVING report_timestamp = MAX(report_timestamp)
+                    ORDER BY date ASC
+                """, conn, params=(item_name, window_start, window_end))
+
+                if hist.empty:
+                    continue
+
+                # Ищем первый день когда остаток упал до 0 или очень низко (< avg/2)
+                threshold = max(1, avg_sales * 0.5) if avg_sales > 0 else 1
+                zero_rows = hist[hist['quantity'] <= threshold]
+
+                if not zero_rows.empty:
+                    actual_zero_date = pd.to_datetime(zero_rows.iloc[0]['date'])
+                    diff_days = abs((actual_zero_date - pred_date).days)
+
+                    if diff_days <= TOLERANCE_DAYS:
+                        # Прогноз точный!
+                        conn.execute(
+                            "UPDATE ai_forecasts SET status='✅ Точный прогноз' WHERE id=?",
+                            (db_id,)
+                        )
+                    # Если diff > TOLERANCE — прогноз ошибся, оставляем текущий статус
+
+            conn.commit()
+
+    except Exception:
+        logger.exception('_check_forecast_accuracy error')
+
+
+def _load_accuracy_stats() -> dict:
+    """
+    Возвращает агрегированную статистику точности прогнозов.
+
+    Возвращает dict с ключами:
+      - total_evaluated: кол-во оценённых прогнозов
+      - accurate_count:  кол-во точных (✅)
+      - accuracy_pct:    % точных
+      - mape:            MAPE по дням (средняя абс. ошибка / среднее предсказание × 100)
+      - weekly_trend:    list of dicts {week, accurate, total} для графика
+    """
+    empty = {
+        'total_evaluated': 0, 'accurate_count': 0,
+        'accuracy_pct': 0.0, 'mape': None, 'weekly_trend': [],
+    }
+    try:
+        with db.get_connection() as conn:
+            # Все прогнозы в терминальных статусах (кроме 🔄 — пересчитан)
+            terminal = pd.read_sql_query("""
+                SELECT id, item_name, predicted_zero_date, created_at, status,
+                       avg_daily_sales, lead_time_days
+                FROM ai_forecasts
+                WHERE status IN (
+                    '✅ Точный прогноз', '📉 Упущенная выгода', '🔴 Товар отсутствует'
+                )
+                ORDER BY created_at DESC
+            """, conn)
+
+            if terminal.empty:
+                return empty
+
+            total = len(terminal)
+            accurate = (terminal['status'] == '✅ Точный прогноз').sum()
+            accuracy_pct = round(accurate / total * 100, 1) if total > 0 else 0.0
+
+            # MAPE: только для точных прогнозов — сравниваем predicted_zero_date
+            # с реальной датой обнуления (если она известна — берём из stocks)
+            mape_errors = []
+            for _, row in terminal[terminal['status'] == '✅ Точный прогноз'].iterrows():
+                pred_date  = pd.to_datetime(row['predicted_zero_date'], errors='coerce')
+                created_at = pd.to_datetime(row['created_at'], errors='coerce')
+                avg_sales  = float(row['avg_daily_sales'] or 0)
+                if pd.isna(pred_date) or pd.isna(created_at) or avg_sales == 0:
+                    continue
+
+                # Ищем фактическое обнуление в stocks
+                hist = pd.read_sql_query("""
+                    SELECT SUBSTR(report_timestamp, 1, 10) AS date, quantity
+                    FROM stocks
+                    WHERE item_name = ?
+                      AND SUBSTR(report_timestamp, 1, 10) >= ?
+                    GROUP BY SUBSTR(report_timestamp, 1, 10)
+                    HAVING report_timestamp = MAX(report_timestamp)
+                    ORDER BY date ASC
+                    LIMIT 30
+                """, conn, params=(row['item_name'], created_at.strftime('%Y-%m-%d')))
+
+                threshold = max(1, avg_sales * 0.5)
+                zero_rows = hist[hist['quantity'] <= threshold]
+                if zero_rows.empty:
+                    continue
+
+                actual_zero = pd.to_datetime(zero_rows.iloc[0]['date'])
+                predicted_days = (pred_date - created_at).days
+                actual_days    = (actual_zero - created_at).days
+                if predicted_days > 0:
+                    ape = abs(actual_days - predicted_days) / predicted_days * 100
+                    mape_errors.append(ape)
+
+            mape = round(sum(mape_errors) / len(mape_errors), 1) if mape_errors else None
+
+            # Недельный тренд
+            terminal['week'] = pd.to_datetime(
+                terminal['created_at'], errors='coerce'
+            ).dt.to_period('W').astype(str)
+
+            weekly = (
+                terminal.groupby('week')
+                .apply(lambda g: pd.Series({
+                    'total':    len(g),
+                    'accurate': (g['status'] == '✅ Точный прогноз').sum(),
+                }))
+                .reset_index()
+                .sort_values('week')
+                .tail(12)  # последние 12 недель
+            )
+            weekly_trend = weekly.to_dict('records')
+
+            return {
+                'total_evaluated': int(total),
+                'accurate_count':  int(accurate),
+                'accuracy_pct':    accuracy_pct,
+                'mape':            mape,
+                'weekly_trend':    weekly_trend,
+            }
+
+    except Exception:
+        logger.exception('_load_accuracy_stats error')
+        return empty
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Страница
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -242,8 +429,10 @@ def setup_page():
                             'Точность прогнозов оптимальна.'
                         ).classes('text-green-400 text-sm')
 
-                # ── Обновляем статусы прогнозов ───────────────────────────
+                # ── Обновляем статусы и проверяем точность прогнозов ──────
                 await ng_run.io_bound(_verify_shadow_forecasts)
+                await ng_run.io_bound(_check_forecast_accuracy)
+                acc_stats = await ng_run.io_bound(_load_accuracy_stats)
                 df_fc = await ng_run.io_bound(_load_forecasts)
 
                 # ── Нет прогнозов ─────────────────────────────────────────
@@ -256,7 +445,7 @@ def setup_page():
                             'Нажмите кнопку ниже, чтобы запустить AI-анализ.'
                         ).classes('text-gray-400')
                 else:
-                    # ── Метрики ───────────────────────────────────────────
+                    # ── Метрики (упущенная выгода + заморозка) ────────────
                     total_lost      = float(df_fc['lost_sales_value'].fillna(0).sum())
                     total_overstock = float(df_fc['overstock_value'].fillna(0).sum())
 
@@ -286,6 +475,126 @@ def setup_page():
                             ui.label(
                                 'Излишки, купленные сверх рекомендаций ИИ'
                             ).style('color:#6b7280; font-size:0.72rem;')
+
+                    ui.separator().style('background:#2a2a2a;')
+
+                    # ── Accuracy Dashboard ────────────────────────────────
+                    ui.label('🎯 Точность прогнозов (Accuracy Dashboard)').classes(
+                        'text-white text-lg font-semibold'
+                    )
+
+                    acc_total    = acc_stats['total_evaluated']
+                    acc_accurate = acc_stats['accurate_count']
+                    acc_pct      = acc_stats['accuracy_pct']
+                    acc_mape     = acc_stats['mape']
+                    acc_trend    = acc_stats['weekly_trend']
+
+                    if acc_total < 3:
+                        with ui.card().classes('w-full p-3').style(
+                            'background:#111827; border:1px dashed #374151;'
+                        ):
+                            ui.label(
+                                '⏳ Данных пока недостаточно для оценки точности. '
+                                f'Оценено прогнозов: {acc_total}. '
+                                f'Нужно минимум 3 завершённых прогноза — система накапливает историю.'
+                            ).style('color:#6b7280; font-size:0.85rem;')
+                    else:
+                        # Карточки точности
+                        with ui.row().classes('gap-4 flex-wrap w-full'):
+                            # Точность %
+                            acc_color = (
+                                '#22c55e' if acc_pct >= 70
+                                else '#f59e0b' if acc_pct >= 40
+                                else '#ef4444'
+                            )
+                            with ui.card().classes('p-5').style(
+                                f'background:#171717; border-left:3px solid {acc_color};'
+                            ):
+                                ui.label(f'{acc_pct:.1f}%').classes(
+                                    'text-white text-2xl font-bold'
+                                )
+                                ui.label('🎯 Точность (Forecast Accuracy)').style(
+                                    'color:#9ca3af; font-size:0.8rem;'
+                                )
+                                ui.label(
+                                    '% прогнозов, попавших в ±3 дня от факта'
+                                ).style('color:#6b7280; font-size:0.72rem;')
+
+                            # MAPE
+                            mape_txt = f'{acc_mape:.1f}%' if acc_mape is not None else '—'
+                            mape_color = (
+                                '#22c55e' if acc_mape is not None and acc_mape < 15
+                                else '#f59e0b' if acc_mape is not None and acc_mape < 35
+                                else '#ef4444'
+                            )
+                            with ui.card().classes('p-5').style(
+                                f'background:#171717; border-left:3px solid {mape_color};'
+                            ):
+                                ui.label(mape_txt).classes(
+                                    'text-white text-2xl font-bold'
+                                )
+                                ui.label('📐 Ошибка прогноза (MAPE)').style(
+                                    'color:#9ca3af; font-size:0.8rem;'
+                                )
+                                ui.label(
+                                    'Средн. % отклонения от фактической даты'
+                                ).style('color:#6b7280; font-size:0.72rem;')
+
+                            # Оценено / точных
+                            with ui.card().classes('p-5').style(
+                                'background:#171717; border-left:3px solid #818cf8;'
+                            ):
+                                ui.label(f'{acc_accurate} / {acc_total}').classes(
+                                    'text-white text-2xl font-bold'
+                                )
+                                ui.label('📊 Точных / Оценено прогнозов').style(
+                                    'color:#9ca3af; font-size:0.8rem;'
+                                )
+                                ui.label(
+                                    'Накопленная история верификации'
+                                ).style('color:#6b7280; font-size:0.72rem;')
+
+                        # Недельный тренд (стековая гистограмма)
+                        if acc_trend:
+                            weeks      = [r['week'] for r in acc_trend]
+                            acc_vals   = [int(r['accurate']) for r in acc_trend]
+                            inac_vals  = [int(r['total']) - int(r['accurate']) for r in acc_trend]
+
+                            ui.echart({
+                                'backgroundColor': 'transparent',
+                                'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'}},
+                                'legend': {
+                                    'data': ['✅ Точные', '❌ Неточные'],
+                                    'textStyle': {'color': '#9ca3af'},
+                                },
+                                'grid': {'left': '3%', 'right': '4%', 'bottom': '3%', 'containLabel': True},
+                                'xAxis': {
+                                    'type': 'category', 'data': weeks,
+                                    'axisLabel': {'color': '#6b7280', 'rotate': 30, 'fontSize': 10},
+                                    'axisLine': {'lineStyle': {'color': '#374151'}},
+                                },
+                                'yAxis': {
+                                    'type': 'value', 'minInterval': 1,
+                                    'axisLabel': {'color': '#6b7280'},
+                                    'splitLine': {'lineStyle': {'color': '#1f2937'}},
+                                },
+                                'series': [
+                                    {
+                                        'name': '✅ Точные',
+                                        'type': 'bar', 'stack': 'total',
+                                        'data': acc_vals,
+                                        'itemStyle': {'color': '#22c55e'},
+                                        'label': {'show': True, 'position': 'inside', 'color': '#fff', 'fontSize': 10},
+                                    },
+                                    {
+                                        'name': '❌ Неточные',
+                                        'type': 'bar', 'stack': 'total',
+                                        'data': inac_vals,
+                                        'itemStyle': {'color': '#374151'},
+                                        'label': {'show': True, 'position': 'inside', 'color': '#9ca3af', 'fontSize': 10},
+                                    },
+                                ],
+                            }).classes('w-full').style('height:220px;')
 
                     ui.separator().style('background:#2a2a2a;')
 
