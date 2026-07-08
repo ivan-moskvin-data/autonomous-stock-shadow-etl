@@ -153,7 +153,7 @@ def _forecasts_today() -> int:
 def _load_forecasts() -> pd.DataFrame:
     try:
         with db.get_connection() as conn:
-            return pd.read_sql_query("""
+            df = pd.read_sql_query("""
                 SELECT
                     f.*,
                     (SELECT quantity FROM stocks s
@@ -162,6 +162,37 @@ def _load_forecasts() -> pd.DataFrame:
                 FROM ai_forecasts f
                 ORDER BY f.created_at DESC
             """, conn)
+
+            if df.empty:
+                return df
+
+            # Батч-загрузка истории остатков для всех товаров одним запросом
+            # (один SELECT вместо N отдельных — минимальная нагрузка)
+            item_list = df['item_name'].dropna().unique().tolist()
+            placeholders = ','.join('?' * len(item_list))
+            hist_df = pd.read_sql_query(f"""
+                SELECT
+                    item_name,
+                    SUBSTR(report_timestamp, 1, 10) AS date,
+                    quantity
+                FROM stocks
+                WHERE item_name IN ({placeholders})
+                  AND report_timestamp >= date('now', '-30 days', 'localtime')
+                GROUP BY item_name, SUBSTR(report_timestamp, 1, 10)
+                HAVING report_timestamp = MAX(report_timestamp)
+                ORDER BY item_name, date ASC
+            """, conn, params=item_list)
+
+            # Группируем историю по товару → список [qty, qty, ...]
+            history_map: dict = {}
+            for name, grp in hist_df.groupby('item_name'):
+                history_map[name] = grp['quantity'].tolist()
+
+            df['sparkline'] = df['item_name'].map(
+                lambda n: history_map.get(n, [])
+            )
+            return df
+
     except Exception:
         return pd.DataFrame()
 
@@ -609,6 +640,7 @@ def setup_page():
                         'avg_daily_sales', 'lead_time_days', 'safety_stock',
                         'reason', 'status',
                         'lost_sales_value', 'overstock_value',
+                        'sparkline',
                     ]].copy()
 
                     disp['current_qty'] = disp['current_qty'].fillna(0).astype(int)
@@ -617,6 +649,10 @@ def setup_page():
                     disp['overstock_value']   = disp['overstock_value'].fillna(0)
                     disp['Упущ. выручка (₽)'] = disp['lost_sales_value'].apply(_fmt_rub)
                     disp['Заморожено (₽)']    = disp['overstock_value'].apply(_fmt_rub)
+                    # sparkline: преобразуем в список чисел (на случай если пришли NaN)
+                    disp['sparkline'] = disp['sparkline'].apply(
+                        lambda v: [int(x) for x in v] if isinstance(v, list) else []
+                    )
                     disp = disp.drop(columns=['lost_sales_value', 'overstock_value'])
                     disp = disp.rename(columns={
                         'created_at':           'Дата',
@@ -635,6 +671,29 @@ def setup_page():
                         {'field': 'Дата',       'headerName': 'Дата',        'flex': 1,  'sortable': True},
                         {'field': 'Товар',      'headerName': 'Товар',       'flex': 3,  'sortable': True, 'filter': True, 'resizable': True},
                         {'field': 'Остаток',    'headerName': 'Остаток',     'flex': 1,  'type': 'numericColumn'},
+                        {
+                            'field': 'sparkline',
+                            'headerName': 'Тренд (30д)',
+                            'flex': 2,
+                            'cellRenderer': 'agSparklineCellRenderer',
+                            'cellRendererParams': {
+                                'sparklineOptions': {
+                                    'type': 'line',
+                                    'line': {'stroke': '#22c55e', 'strokeWidth': 1.5},
+                                    'marker': {'enabled': False},
+                                    'crosshairs': {
+                                        'xLine': {'enabled': True, 'lineDash': 'dash', 'stroke': '#374151'},
+                                        'yLine': {'enabled': True, 'lineDash': 'dash', 'stroke': '#374151'},
+                                    },
+                                    'tooltip': {
+                                        'enabled': True,
+                                        'renderer': 'function(params){return {title:"",content:params.yValue+" шт"}}',
+                                    },
+                                    'fill': 'rgba(34,197,94,0.08)',
+                                    'padding': {'top': 6, 'bottom': 6},
+                                },
+                            },
+                        },
                         {'field': 'Обнулится',  'headerName': 'Обнулится',   'flex': 1,  'sortable': True},
                         {'field': 'Заказ (шт)', 'headerName': 'Заказ (шт)', 'flex': 1,  'type': 'numericColumn'},
                         {'field': 'Расход/день','headerName': 'Расход/д',    'flex': 1,  'type': 'numericColumn'},
@@ -666,6 +725,7 @@ def setup_page():
                         'columnDefs':         col_defs,
                         'rowData':            disp.to_dict('records'),
                         'defaultColDef':      {'resizable': True},
+                        'rowHeight':          60,
                         'pagination':         True,
                         'paginationPageSize': 15,
                     }).classes('w-full ag-theme-balham-dark').style('height:500px;')
