@@ -23,7 +23,7 @@ CONFIG = load_config()
 # --- ПУТИ ИЗ КОНФИГА ---
 LAST_RUN_FILE = BASE_DIR / CONFIG['paths']['last_run_file']
 PARSER_SCRIPT = BASE_DIR / "src" / "parser.py"
-FORECASTER_SCRIPT = BASE_DIR / "src" / "ai_forecaster.py"
+FORECASTER_SCRIPT = BASE_DIR / "src" / "ai_services.py"
 AI_PENDING_FILE = BASE_DIR / CONFIG['paths']['ai_pending_flag']
 
 if sys.platform == "win32":

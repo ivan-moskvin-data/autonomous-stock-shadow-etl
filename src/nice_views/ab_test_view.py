@@ -732,72 +732,149 @@ def setup_page():
 
                 ui.separator().style('background:#2a2a2a;')
 
-                # ── Кнопка запуска AI-анализа ─────────────────────────────
-                has_pending   = _AI_PENDING_FLAG.exists()
-                today_count   = _forecasts_today()
+                # ── Статус автоматизации ──────────────────────────────────
+                ui.label('⚙️ Управление AI-анализом').classes(
+                    'text-white text-lg font-semibold'
+                )
 
-                if has_pending:
-                    with ui.card().classes('w-full p-3').style(
-                        'background:#1c1917; border:1px solid #a16207;'
+                has_pending = _AI_PENDING_FLAG.exists()
+                today_count = _forecasts_today()
+
+                # Читаем дату последнего парсинга
+                try:
+                    _last_run_cfg = db.CONFIG.get('paths', {})
+                    _base_dir = Path(__file__).resolve().parent.parent.parent
+                    _last_run_path = _base_dir / _last_run_cfg.get('last_run_file', 'logs/last_run.txt')
+                    last_parse_date = _last_run_path.read_text(encoding='utf-8').strip() \
+                        if _last_run_path.exists() else None
+                except Exception:
+                    last_parse_date = None
+
+                with ui.row().classes('gap-4 flex-wrap w-full'):
+                    # ── Блок «Автоматический режим» ────────────────────────
+                    with ui.card().classes('p-4 flex-1').style(
+                        'background:#111827; border:1px solid #1f2937; min-width:280px;'
                     ):
+                        ui.label('🤖 Автоматический режим').classes(
+                            'text-white font-semibold mb-2'
+                        )
                         ui.label(
-                            '⚠️ Есть необработанные данные: парсер собрал свежую информацию, '
-                            'но AI-анализ ещё не запущен. Нажмите кнопку ниже.'
-                        ).classes('text-yellow-300 text-sm')
-                    btn_text  = '🚀 Запустить анализ свежих данных'
-                    btn_color = 'primary'
-                elif today_count > 0:
-                    with ui.card().classes('w-full p-3').style(
-                        'background:#052e16; border:1px solid #22c55e;'
-                    ):
-                        ui.label(
-                            f'✅ План на сегодня выполнен. '
-                            f'В базе {today_count} прогнозов за текущие сутки.'
-                        ).classes('text-green-400 text-sm')
-                    btn_text  = '🔄 Принудительный пересчёт'
-                    btn_color = 'secondary'
-                else:
-                    btn_text  = '🚀 Запустить первичный анализ'
-                    btn_color = 'primary'
+                            'После каждого успешного парсинга autostart.py '
+                            'автоматически запускает src/ai_services.py — '
+                            'прогнозы обновляются без участия пользователя.'
+                        ).style('color:#6b7280; font-size:0.8rem;')
 
-                status_lbl = ui.label('').style('color:#818cf8; font-weight:600;')
-                status_lbl.set_visibility(False)
+                        ui.separator().style('background:#1f2937; margin:8px 0;')
 
-                async def do_forecast():
-                    forecast_btn.set_enabled(False)
-                    status_lbl.set_text('🤖 ИИ анализирует графики продаж…')
-                    status_lbl.set_visibility(True)
-                    try:
-                        result = await ng_run.io_bound(ai_services.run_batch_forecast)
+                        if last_parse_date:
+                            ui.label(f'📅 Последний парсинг: {last_parse_date}').style(
+                                'color:#9ca3af; font-size:0.82rem;'
+                            )
 
-                        if result == 'no_key':
-                            ui.notify('❌ Не найден API ключ Gemini!', type='negative', timeout=0)
-                        elif result == 'empty':
-                            ui.notify('⚠️ Нет товаров для анализа.', type='warning')
-                            if has_pending and _AI_PENDING_FLAG.exists():
-                                _AI_PENDING_FLAG.unlink()
-                        elif isinstance(result, str) and result.startswith('error_'):
-                            err = result.split('_', 1)[1]
-                            ui.notify(f'❌ Ошибка связи с ИИ: {err}', type='negative', timeout=0)
-                        elif isinstance(result, str) and result.startswith('ok_'):
-                            count = result.split('_')[1]
-                            ui.notify(f'✅ Готово! Сгенерировано прогнозов: {count}.', type='positive')
-                            if _AI_PENDING_FLAG.exists():
-                                _AI_PENDING_FLAG.unlink()
-                            await render_main.refresh()
+                        if has_pending:
+                            # Парсер отработал, но ai_forecaster не успел
+                            with ui.row().classes('items-center gap-2 mt-1'):
+                                ui.icon('warning', size='sm').style('color:#f59e0b;')
+                                ui.label(
+                                    'Парсер собрал данные, но AI-анализ ещё не выполнен. '
+                                    'Возможно, ai_forecaster.py упал — запустите вручную.'
+                                ).style('color:#fbbf24; font-size:0.82rem;')
+                        elif today_count > 0:
+                            with ui.row().classes('items-center gap-2 mt-1'):
+                                ui.icon('check_circle', size='sm').style('color:#22c55e;')
+                                ui.label(
+                                    f'Автоанализ выполнен сегодня: {today_count} прогнозов в базе.'
+                                ).style('color:#86efac; font-size:0.82rem;')
                         else:
-                            ui.notify(f'Результат: {result}', type='info')
+                            with ui.row().classes('items-center gap-2 mt-1'):
+                                ui.icon('schedule', size='sm').style('color:#6b7280;')
+                                ui.label(
+                                    'Анализ сегодня ещё не запускался. '
+                                    'Ждём следующего парсинга.'
+                                ).style('color:#6b7280; font-size:0.82rem;')
 
-                    except Exception as ex:
-                        logger.exception('run_batch_forecast error')
-                        ui.notify(f'❌ Критическая ошибка: {ex}', type='negative', timeout=0)
-                    finally:
-                        forecast_btn.set_enabled(True)
+                    # ── Блок «Ручной запуск» ───────────────────────────────
+                    with ui.card().classes('p-4 flex-1').style(
+                        'background:#111827; border:1px solid #1f2937; min-width:280px;'
+                    ):
+                        ui.label('🖱️ Ручной запуск').classes(
+                            'text-white font-semibold mb-2'
+                        )
+                        ui.label(
+                            'Используйте если: AI-скрипт упал автоматически, '
+                            'хотите пересчитать прогнозы с новыми параметрами, '
+                            'или просто проверить систему.'
+                        ).style('color:#6b7280; font-size:0.8rem;')
+
+                        ui.separator().style('background:#1f2937; margin:8px 0;')
+
+                        status_lbl = ui.label('').style(
+                            'color:#818cf8; font-weight:600; font-size:0.85rem;'
+                        )
                         status_lbl.set_visibility(False)
 
-                forecast_btn = ui.button(btn_text, on_click=do_forecast) \
-                    .props(f'color={btn_color} no-caps') \
-                    .classes('w-full')
+                        async def do_forecast():
+                            forecast_btn.set_enabled(False)
+                            status_lbl.set_text('🤖 ИИ анализирует графики продаж…')
+                            status_lbl.set_visibility(True)
+                            try:
+                                result = await ng_run.io_bound(ai_services.run_batch_forecast)
+
+                                if result == 'no_key':
+                                    ui.notify(
+                                        '❌ API-ключ не найден! Проверьте secrets.toml.',
+                                        type='negative', timeout=0
+                                    )
+                                elif result == 'empty':
+                                    ui.notify(
+                                        '⚠️ Нет товаров для анализа — '
+                                        'нет снижений остатков за последние 30 дней.',
+                                        type='warning'
+                                    )
+                                    if _AI_PENDING_FLAG.exists():
+                                        _AI_PENDING_FLAG.unlink()
+                                elif isinstance(result, str) and result.startswith('error_'):
+                                    err = result.split('_', 1)[1]
+                                    ui.notify(
+                                        f'❌ Ошибка AI: {err}',
+                                        type='negative', timeout=0
+                                    )
+                                elif isinstance(result, str) and result.startswith('ok_'):
+                                    count = result.split('_', 1)[1]
+                                    ui.notify(
+                                        f'✅ Готово! Сгенерировано прогнозов: {count}.',
+                                        type='positive'
+                                    )
+                                    if _AI_PENDING_FLAG.exists():
+                                        _AI_PENDING_FLAG.unlink()
+                                    await render_main.refresh()
+                                else:
+                                    ui.notify(f'Результат: {result}', type='info')
+
+                            except Exception as ex:
+                                logger.exception('run_batch_forecast error')
+                                ui.notify(
+                                    f'❌ Критическая ошибка: {ex}',
+                                    type='negative', timeout=0
+                                )
+                            finally:
+                                forecast_btn.set_enabled(True)
+                                status_lbl.set_visibility(False)
+
+                        btn_label = (
+                            '🚀 Запустить анализ (pending данные)'
+                            if has_pending else
+                            '🔄 Принудительный пересчёт'
+                            if today_count > 0 else
+                            '🚀 Запустить первичный анализ'
+                        )
+                        btn_color = 'primary' if has_pending or today_count == 0 else 'secondary'
+
+                        forecast_btn = ui.button(btn_label, on_click=do_forecast) \
+                            .props(f'color={btn_color} no-caps') \
+                            .classes('w-full mt-1')
+                        status_lbl  # rendered after button
+
 
             await render_main()
 

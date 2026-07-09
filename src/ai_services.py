@@ -354,3 +354,51 @@ def run_batch_forecast():
 
     return f"ok_{success_count}"
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Точка входа для запуска как скрипта (python src/ai_services.py)
+#  Вызывается из autostart.py после парсинга. Можно запустить вручную.
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
+    import sys
+    from pathlib import Path as _Path
+
+    _log_dir = BASE_DIR / 'logs'
+    _log_dir.mkdir(parents=True, exist_ok=True)
+    _fh = logging.FileHandler(_log_dir / 'ai_forecaster.log', encoding='utf-8')
+    _fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    logging.getLogger().addHandler(_fh)
+
+    logging.info('=== AI Forecaster (ai_services.py) запущен ===')
+
+    _pending_path = None
+    try:
+        _pending_path = BASE_DIR / CONFIG['paths']['ai_pending_flag']
+    except Exception:
+        pass
+
+    _result = run_batch_forecast()
+    logging.info(f'run_batch_forecast() -> {_result}')
+
+    if _result == 'no_key':
+        logging.error('API-ключ не найден.')
+        sys.exit(1)
+    elif _result == 'empty':
+        logging.warning('Нет товаров для прогноза.')
+        if _pending_path and _pending_path.exists():
+            _pending_path.unlink()
+        sys.exit(0)
+    elif isinstance(_result, str) and _result.startswith('error_'):
+        logging.error(f'Ошибка: {_result.split("_", 1)[1]}')
+        sys.exit(1)
+    elif isinstance(_result, str) and _result.startswith('ok_'):
+        logging.info(f'Готово. Прогнозов: {_result.split("_", 1)[1]}.')
+        if _pending_path and _pending_path.exists():
+            _pending_path.unlink()
+        sys.exit(0)
+    else:
+        logging.warning(f'Неожиданный результат: {_result}')
+        sys.exit(0)
+
