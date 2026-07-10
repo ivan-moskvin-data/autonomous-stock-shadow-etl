@@ -11,7 +11,6 @@ import base64
 import io
 from pathlib import Path
 from PIL import Image
-import streamlit as st
 
 # --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")

@@ -15,7 +15,7 @@ env/
 .vscode/
 .antigravity/
 .amazonq/
-.roo/
+.roo/*
 
 # Logs
 logs/*
@@ -39,3 +39,4 @@ _workspace
 
 # Конфигурация с секретами
 /config.json
+opencode.json

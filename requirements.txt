@@ -2,11 +2,8 @@ requests
 beautifulsoup4
 pandas
 rich
-streamlit
 nicegui
 Pillow
-matplotlib
-seaborn
 google-genai
 psutil
 httpx[socks]
