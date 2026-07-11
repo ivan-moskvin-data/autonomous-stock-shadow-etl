@@ -126,9 +126,29 @@ def run_batch_forecast():
 
         if active_items.empty: return "empty"
 
+        # ── Батч-загрузка ожидаемых поставок для всех товаров одним запросом ──
+        # Учитываем только записи со статусом 'Ожидает' (ещё не поступили на склад).
+        # Результат: словарь {item_name: qty_in_transit}
+        all_names = active_items['item_name'].tolist()
+        placeholders = ','.join('?' * len(all_names))
+        try:
+            deliveries_df = pd.read_sql_query(f"""
+                SELECT item_name, SUM(qty_expected) AS qty_in_transit
+                FROM expected_deliveries
+                WHERE status = 'Ожидает'
+                  AND item_name IN ({placeholders})
+                GROUP BY item_name
+            """, conn, params=all_names)
+            in_transit_map = dict(
+                zip(deliveries_df['item_name'], deliveries_df['qty_in_transit'])
+            )
+        except Exception:
+            # Таблица может не существовать если Приёмка ещё не использовалась
+            in_transit_map = {}
+
         batch_size = CONFIG['ai']['forecast_batch_size']
         success_count = 0
-        
+
         for i in range(0, len(active_items), batch_size):
             batch = active_items.iloc[i:i+batch_size]
             items_data = []
@@ -175,10 +195,11 @@ def run_batch_forecast():
                     days_tracked = 1
                 
                 # --- МАТЕМАТИЧЕСКИЙ РАСЧЁТ ПРОГНОЗА ---
-                current_qty = int(row['current_qty'])
-                lead_time = CONFIG['ai']['lead_time_days']
-                z = CONFIG['ai']['safety_stock_multiplier']
-                
+                current_qty    = int(row['current_qty'])
+                qty_in_transit = int(in_transit_map.get(row['item_name'], 0))
+                lead_time      = CONFIG['ai']['lead_time_days']
+                z              = CONFIG['ai']['safety_stock_multiplier']
+
                 # std_dev считаем по дневным продажам (не по остаткам!).
                 # Std по остаткам раздувается из-за поставок и даёт неверный страховой запас.
                 if len(daily_sales_list) >= 2:
@@ -194,39 +215,39 @@ def run_batch_forecast():
                 else:
                     # Страховой запас: z × σ × sqrt(lead_time)
                     safety_stock = int(z * std_dev * (lead_time ** 0.5))
-                
+
                 # ── Стандартная формула закупок (ROP — Reorder Point) ──────────
                 #
-                # ROP = сколько товара нужно иметь в момент размещения заказа,
-                #       чтобы покрыть потребность за время поставки + страховой запас.
+                # ROP = avg_sales × lead_time + safety_stock
                 #
-                #   ROP = avg_sales × lead_time + safety_stock
+                # Сколько заказать = ROP − (текущий_остаток + в_пути).
+                # qty_in_transit — товар из expected_deliveries (статус 'Ожидает'):
+                # он ещё не на складе, но уже оплачен и едет, поэтому вычитаем его
+                # из потребности чтобы не заказывать то, что уже в дороге.
                 #
-                # Сколько заказать = ROP - текущий_остаток (если остаток ниже ROP).
-                # Если текущий остаток уже выше ROP — заказывать не нужно (= 0).
-                #
-                # Пример: avg=10/день, lead=14дн, safety=15, остаток=50
-                #   ROP = 10×14 + 15 = 155
-                #   order = 155 - 50 = 105 шт  ← корректный заказ
-                #
-                # Старая формула давала: 50 + 10×14 + 15 = 205 шт  ← завышена вдвое
+                # Пример: avg=10/д, lead=14д, safety=15, остаток=50, в_пути=60
+                #   ROP   = 10×14 + 15 = 155
+                #   order = max(0, 155 − 50 − 60) = 45 шт  (без учёта: 105 шт)
 
-                reorder_point = int(avg_sales * lead_time) + safety_stock
-                recommended_qty = max(0, reorder_point - current_qty)
-                
-                # Дни до нуля (математически, без LLM)
+                reorder_point  = int(avg_sales * lead_time) + safety_stock
+                effective_stock = current_qty + qty_in_transit
+                recommended_qty = max(0, reorder_point - effective_stock)
+
+                # Дни до нуля — считаем только по текущему остатку
+                # (поставка ещё не пришла, неизвестно когда придёт)
                 days_to_zero = round(current_qty / avg_sales, 1) if avg_sales > 0 else 999.0
-                
+
                 items_data.append({
-                    "name": row['item_name'],
-                    "sku": row['sku'],
-                    "stock": current_qty,
-                    "avg_sales": avg_sales,
-                    "lead_time": lead_time,
-                    "safety_stock": safety_stock,
-                    "reorder_point": reorder_point,
+                    "name":           row['item_name'],
+                    "sku":            row['sku'],
+                    "stock":          current_qty,
+                    "in_transit":     qty_in_transit,
+                    "avg_sales":      avg_sales,
+                    "lead_time":      lead_time,
+                    "safety_stock":   safety_stock,
+                    "reorder_point":  reorder_point,
                     "recommended_qty": recommended_qty,
-                    "days_to_zero": days_to_zero
+                    "days_to_zero":   days_to_zero,
                 })
 
             today_date = pd.Timestamp.now().strftime('%Y-%m-%d')
@@ -274,11 +295,16 @@ def run_batch_forecast():
                 forecasts = []
                 for item in items_data:
                     rop = int(item['avg_sales'] * item['lead_time']) + item['safety_stock']
+                    transit_note = (
+                        f" В пути: {item['in_transit']} шт (учтено)."
+                        if item.get('in_transit', 0) > 0 else ""
+                    )
+                    effective = item['stock'] + item.get('in_transit', 0)
                     reason = (
                         f"[Авто] Расход: {item['avg_sales']:.2f} шт/день. "
-                        f"Хватит на: {item['days_to_zero']:.1f} дней. "
+                        f"Хватит на: {item['days_to_zero']:.1f} дней.{transit_note} "
                         f"ROP = {int(item['avg_sales'])} × {item['lead_time']} + {item['safety_stock']} = {rop} шт. "
-                        f"Заказать: max(0, {rop} - {item['stock']}) = {item['recommended_qty']} шт."
+                        f"Заказать: max(0, {rop} - {effective}) = {item['recommended_qty']} шт."
                     )
                     forecasts.append({
                         "item_name": item['name'],
