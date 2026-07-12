@@ -641,10 +641,19 @@ def setup_page():
                         'reason', 'status',
                         'lost_sales_value', 'overstock_value',
                         'sparkline',
-                    ]].copy()
+                        'abc_category',
+                    ]].copy() if 'abc_category' in df_fc.columns else df_fc[[
+                        'created_at', 'item_name', 'current_qty',
+                        'predicted_zero_date', 'recommended_qty',
+                        'avg_daily_sales', 'lead_time_days', 'safety_stock',
+                        'reason', 'status',
+                        'lost_sales_value', 'overstock_value',
+                        'sparkline',
+                    ]].copy().assign(abc_category='?')
 
                     disp['current_qty'] = disp['current_qty'].fillna(0).astype(int)
                     disp['created_at']  = disp['created_at'].astype(str).str[:10]
+                    disp['abc_category'] = disp['abc_category'].fillna('C')
                     disp['lost_sales_value']  = disp['lost_sales_value'].fillna(0)
                     disp['overstock_value']   = disp['overstock_value'].fillna(0)
                     disp['Упущ. выручка (₽)'] = disp['lost_sales_value'].apply(_fmt_rub)
@@ -665,12 +674,26 @@ def setup_page():
                         'safety_stock':         'Страх. запас',
                         'reason':               'Обоснование (AI)',
                         'status':               'Статус',
+                        'abc_category':         'ABC',
                     })
 
                     col_defs = [
-                        {'field': 'Дата',       'headerName': 'Дата',        'flex': 1,  'sortable': True},
-                        {'field': 'Товар',      'headerName': 'Товар',       'flex': 3,  'sortable': True, 'filter': True, 'resizable': True},
-                        {'field': 'Остаток',    'headerName': 'Остаток',     'flex': 1,  'type': 'numericColumn'},
+                        {'field': 'Дата',  'headerName': 'Дата', 'flex': 1, 'sortable': True},
+                        {
+                            'field': 'ABC', 'headerName': 'ABC', 'flex': 1,
+                            'sortable': True,
+                            'cellStyle': {
+                                'function': (
+                                    "const v=params.value||'';"
+                                    "if(v==='A')return{color:'#fbbf24',fontWeight:'800',fontSize:'1rem',textAlign:'center'};"
+                                    "if(v==='B')return{color:'#38bdf8',fontWeight:'700',textAlign:'center'};"
+                                    "return{color:'#6b7280',textAlign:'center'};"
+                                )
+                            },
+                            'headerTooltip': 'A — критически важные (80% оборота), B — умеренно важные (15%), C — низкоприоритетные (5%)',
+                        },
+                        {'field': 'Товар', 'headerName': 'Товар', 'flex': 3, 'sortable': True, 'filter': True, 'resizable': True},
+                        {'field': 'Остаток', 'headerName': 'Остаток', 'flex': 1, 'type': 'numericColumn'},
                         {
                             'field': 'sparkline',
                             'headerName': 'Тренд (30д)',

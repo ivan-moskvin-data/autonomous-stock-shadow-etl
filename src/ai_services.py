@@ -149,6 +149,37 @@ def run_batch_forecast():
         batch_size = CONFIG['ai']['forecast_batch_size']
         success_count = 0
 
+        # ── ABC-анализ до разбивки на подбатчи ────────────────────────────
+        # Оборот товара = avg_sales × price за период наблюдения
+        # Группы:
+        #   A — товары дающие первые 80% оборота (критически важные)
+        #   B — 80–95%  (умеренно важные)
+        #   C — 95–100% (низкоприоритетные)
+        abc_df = active_items.copy()
+        abc_df['revenue'] = (
+            pd.to_numeric(abc_df.get('price', 0), errors='coerce').fillna(0)
+            * pd.to_numeric(abc_df['peak_qty'] - abc_df['current_qty'], errors='coerce').fillna(0)
+        ).clip(lower=0)
+        # Если цены нет — фоллбек: используем объём продаж как прокси выручки
+        if abc_df['revenue'].sum() == 0:
+            abc_df['revenue'] = (
+                pd.to_numeric(abc_df['peak_qty'] - abc_df['current_qty'], errors='coerce').fillna(0)
+            ).clip(lower=0)
+        total_rev = abc_df['revenue'].sum()
+        abc_df = abc_df.sort_values('revenue', ascending=False)
+        abc_df['cum_share'] = abc_df['revenue'].cumsum() / total_rev if total_rev > 0 else 0
+        abc_df['abc'] = 'C'
+        abc_df.loc[abc_df['cum_share'] <= 0.95, 'abc'] = 'B'
+        abc_df.loc[abc_df['cum_share'] <= 0.80, 'abc'] = 'A'
+        abc_map = dict(zip(abc_df['item_name'], abc_df['abc']))
+
+        # Обеспечиваем наличие колонки abc_category в БД (backward-compatible)
+        try:
+            conn.execute("ALTER TABLE ai_forecasts ADD COLUMN abc_category TEXT DEFAULT 'C'")
+            conn.commit()
+        except Exception:
+            pass  # колонка уже есть
+
         for i in range(0, len(active_items), batch_size):
             batch = active_items.iloc[i:i+batch_size]
             items_data = []
@@ -248,6 +279,7 @@ def run_batch_forecast():
                     "reorder_point":  reorder_point,
                     "recommended_qty": recommended_qty,
                     "days_to_zero":   days_to_zero,
+                    "abc":            abc_map.get(row['item_name'], 'C'),
                 })
 
             today_date = pd.Timestamp.now().strftime('%Y-%m-%d')
@@ -339,12 +371,12 @@ def run_batch_forecast():
                             UPDATE ai_forecasts
                             SET predicted_zero_date = ?, recommended_qty = ?, reason = ?,
                                 avg_daily_sales = ?, lead_time_days = ?, safety_stock = ?,
-                                base_demand = ?, status = '⏳ Наблюдение'
+                                base_demand = ?, abc_category = ?, status = '⏳ Наблюдение'
                             WHERE id = ?
                         """, (
                             calc_zero_date, item_data['recommended_qty'], f['reason'],
                             avg_s, item_data['lead_time'], item_data['safety_stock'],
-                            item_data['reorder_point'], existing[0]
+                            item_data['reorder_point'], item_data['abc'], existing[0]
                         ))
                     else:
                         conn.execute(
@@ -355,13 +387,13 @@ def run_batch_forecast():
                         conn.execute("""
                             INSERT INTO ai_forecasts
                             (item_name, sku, predicted_zero_date, recommended_qty, reason,
-                             avg_daily_sales, lead_time_days, safety_stock, base_demand)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             avg_daily_sales, lead_time_days, safety_stock, base_demand, abc_category)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
                             f['item_name'], f['sku'], calc_zero_date,
                             item_data['recommended_qty'], f['reason'],
                             avg_s, item_data['lead_time'], item_data['safety_stock'],
-                            item_data['reorder_point']
+                            item_data['reorder_point'], item_data['abc']
                         ))
 
                 conn.commit()
