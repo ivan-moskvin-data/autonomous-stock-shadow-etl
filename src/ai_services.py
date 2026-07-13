@@ -283,34 +283,91 @@ def run_batch_forecast():
                 })
 
             today_date = pd.Timestamp.now().strftime('%Y-%m-%d')
-            # LLM используется только для генерации текстового обоснования (reason).
-            # Вся математика (avg_sales, ROP, recommended_qty) уже посчитана выше.
+
+            # ── Вспомогательная функция: детерминированный диагноз ───────────
+            # urgency, risk, action вычисляет Python (не LLM) — предсказуемо и быстро.
+            # LLM добавляет только 'note' — контекст который Python не знает.
+            def _build_diagnosis(item: dict, note: str = '') -> str:
+                dtoz = item['days_to_zero']
+                lt   = item['lead_time']
+                rop  = int(item['avg_sales'] * item['lead_time']) + item['safety_stock']
+                eff  = item['stock'] + item.get('in_transit', 0)
+
+                if dtoz < lt:
+                    urgency = '🔴 Критично'
+                    risk    = (
+                        f"Остаток обнулится через {dtoz:.0f} дн., "
+                        f"а поставка идёт {lt} дн. — товар закончится до прихода."
+                    )
+                elif dtoz < lt * 1.5:
+                    urgency = '🟡 Внимание'
+                    risk    = (
+                        f"Хватит на {dtoz:.0f} дн. при сроке поставки {lt} дн. "
+                        f"— запас критически мал."
+                    )
+                else:
+                    urgency = '🟢 Норма'
+                    risk    = f"Хватит на {dtoz:.0f} дн. — запаса достаточно для покрытия поставки."
+
+                action = f"Заказать {item['recommended_qty']} шт (ROP {rop} − склад+пути {eff})."
+
+                parts = [urgency, f"Риск: {risk}", f"Действие: {action}"]
+                if note:
+                    parts.append(f"💡 {note}")
+                return ' | '.join(parts)
+
+            # ── Промпт для LLM: только поле 'note' ───────────────────────────
+            # Передаём краткую сводку без избыточных цифр.
+            # LLM видит: название, ABC, дней до нуля, в пути — и пишет один
+            # нетривиальный комментарий (сезон, тренд, аномалия, риск категории).
+            llm_summaries = [
+                {
+                    "name":        item["name"],
+                    "abc":         item["abc"],
+                    "days_to_zero": item["days_to_zero"],
+                    "avg_sales":   item["avg_sales"],
+                    "in_transit":  item.get("in_transit", 0),
+                    "recommended_qty": item["recommended_qty"],
+                }
+                for item in items_data
+            ]
             prompt = (
-                f"Сегодня: {today_date}. ДАННЫЕ: {json.dumps(items_data, ensure_ascii=False)}. "
-                f"ПРАВИЛА: 1. 'reason' — краткое обоснование прогноза на основе математических расчётов. "
-                f"ВЕРНИ JSON: [ {{\"item_name\": \"...\", \"sku\": \"...\", \"reason\": \"...\"}} ]"
+                f"Сегодня: {today_date}.\n"
+                f"Данные по товарам:\n{json.dumps(llm_summaries, ensure_ascii=False, indent=2)}\n\n"
+                "Для каждого товара напиши ОДНО предложение-примечание (note) — "
+                "что-то нетривиальное, что не видно из цифр: сезонность, "
+                "необычный темп продаж, риск категории A, влияние in_transit и т.п. "
+                "Если нечего добавить — верни пустую строку.\n"
+                "ВЕРНИ СТРОГО JSON-массив (без markdown):\n"
+                '[ {"item_name": "...", "sku": "...", "note": "..."} ]\n'
+                "Одно предложение на товар. Кратко. На русском."
             )
             payload = {
-                "model": CONFIG['ai']['model_forecast'],
-                "messages": [{"role": "user", "content": prompt}],
+                "model":       CONFIG['ai']['model_forecast'],
+                "messages":    [{"role": "user", "content": prompt}],
                 "temperature": CONFIG['ai']['temperature'],
             }
 
             retry_count = CONFIG['crawler'].get('retry_count', 3)
-            forecasts = None
+            note_map: dict = {}   # {item_name: note_text}
             llm_used = False
 
             for attempt in range(retry_count):
                 try:
                     raw_text = call_openrouter(payload)
-                    forecasts = json.loads(
+                    llm_notes = json.loads(
                         raw_text.replace("```json", "").replace("```", "").strip()
                     )
+                    if not isinstance(llm_notes, list) or not llm_notes:
+                        raise ValueError('LLM вернул пустой или некорректный список')
+                    if 'note' not in llm_notes[0] and 'item_name' not in llm_notes[0]:
+                        raise ValueError('LLM не вернул поле note')
+                    note_map = {r.get('item_name', ''): r.get('note', '') for r in llm_notes}
                     llm_used = True
-                    break  # ← только здесь, после успешного парсинга ответа LLM
+                    break
 
                 except Exception as e:
-                    wait_sec = 2 ** (attempt + 1)  # 2, 4, 8 секунд
+                    wait_sec = 2 ** (attempt + 1)
                     logging.warning(
                         f"[AI] Попытка {attempt + 1}/{retry_count} не удалась: {e}. "
                         f"Повтор через {wait_sec}с..."
@@ -318,31 +375,21 @@ def run_batch_forecast():
                     if attempt < retry_count - 1:
                         time.sleep(wait_sec)
 
-            if forecasts is None:
-                # Все попытки исчерпаны — используем шаблонный reason, но логируем
+            if not llm_used:
                 logging.warning(
                     f"[AI] LLM недоступен после {retry_count} попыток. "
-                    f"Используем шаблонный reason для {len(items_data)} товаров."
+                    f"Диагноз будет без note для {len(items_data)} товаров."
                 )
-                forecasts = []
-                for item in items_data:
-                    rop = int(item['avg_sales'] * item['lead_time']) + item['safety_stock']
-                    transit_note = (
-                        f" В пути: {item['in_transit']} шт (учтено)."
-                        if item.get('in_transit', 0) > 0 else ""
-                    )
-                    effective = item['stock'] + item.get('in_transit', 0)
-                    reason = (
-                        f"[Авто] Расход: {item['avg_sales']:.2f} шт/день. "
-                        f"Хватит на: {item['days_to_zero']:.1f} дней.{transit_note} "
-                        f"ROP = {int(item['avg_sales'])} × {item['lead_time']} + {item['safety_stock']} = {rop} шт. "
-                        f"Заказать: max(0, {rop} - {effective}) = {item['recommended_qty']} шт."
-                    )
-                    forecasts.append({
-                        "item_name": item['name'],
-                        "sku": item['sku'],
-                        "reason": reason,
-                    })
+
+            # ── Собираем финальные записи для БД ─────────────────────────────
+            forecasts = [
+                {
+                    "item_name": item["name"],
+                    "sku":       item["sku"],
+                    "reason":    _build_diagnosis(item, note_map.get(item["name"], "")),
+                }
+                for item in items_data
+            ]
 
             # ── Запись в БД (один раз за батч, после получения forecasts) ────────
             try:

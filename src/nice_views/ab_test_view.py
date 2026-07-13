@@ -672,7 +672,7 @@ def setup_page():
                         'avg_daily_sales':      'Расход/день',
                         'lead_time_days':       'Срок пост.',
                         'safety_stock':         'Страх. запас',
-                        'reason':               'Обоснование (AI)',
+                        'reason':               'Диагноз',
                         'status':               'Статус',
                         'abc_category':         'ABC',
                     })
@@ -739,9 +739,9 @@ def setup_page():
                          'flex': 1, 'cellStyle': {'color': '#ef4444', 'fontWeight': '600'}},
                         {'field': 'Заморожено (₽)',    'headerName': 'Заморожено',
                          'flex': 1, 'cellStyle': {'color': '#38bdf8'}},
-                        {'field': 'Обоснование (AI)',  'headerName': 'Обоснование AI',
-                         'flex': 3, 'resizable': True,
-                         'cellStyle': {'color': '#6b7280', 'fontSize': '0.8rem'}},
+                        {'field': 'Диагноз', 'headerName': 'Диагноз (AI)',
+                         'flex': 4, 'resizable': True,
+                         'cellStyle': {'color': '#d1d5db', 'fontSize': '0.8rem', 'whiteSpace': 'normal', 'lineHeight': '1.4'}},
                     ]
 
                     ui.aggrid({
