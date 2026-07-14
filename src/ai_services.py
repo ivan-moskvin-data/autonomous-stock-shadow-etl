@@ -32,34 +32,69 @@ def get_api_key():
     with open(SECRETS_PATH, "rb") as f:
         return tomllib.load(f).get("OPENROUTER_API_KEY")
 
-@st.cache_data(ttl=60, show_spinner=False)
-def check_ai_connection() -> bool:
-    """Проверяет доступность OpenRouter (работает без прокси)"""
-    try:
-        requests.get("https://openrouter.ai/api/v1/models", timeout=3.0)
-        return True
-    except:
-        return False
 
-def call_openrouter(payload: dict) -> str:
+def call_openrouter(payload: dict, max_attempts: int = 3) -> str:
+    """
+    POST-запрос к OpenRouter с retry и exponential backoff.
+    max_attempts: сколько раз пытаться (2s / 4s / 8s паузы между попытками).
+    Возвращает текст ответа LLM или поднимает исключение с подробным описанием.
+    """
     api_key = get_api_key()
-    if not api_key: raise ValueError("OPENROUTER_API_KEY не найден в secrets.toml")
-    
+    if not api_key:
+        raise ValueError("OPENROUTER_API_KEY не найден в secrets.toml")
+
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com",
-        "X-Title": "Autonomous Stock Shadow"
+        "Content-Type":  "application/json",
+        "HTTP-Referer":  "https://github.com",
+        "X-Title":       "Autonomous Stock Shadow",
     }
-    
-    response = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=60
-    )
-    response.raise_for_status()
-    return response.json()['choices'][0]['message']['content']
+
+    last_exc: Exception = RuntimeError("Нет попыток")
+    for attempt in range(max_attempts):
+        try:
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=60,
+            )
+            if response.status_code != 200:
+                body = response.text[:300]
+                raise requests.HTTPError(
+                    f"HTTP {response.status_code}: {body}",
+                    response=response,
+                )
+            return response.json()["choices"][0]["message"]["content"]
+
+        except Exception as exc:
+            last_exc = exc
+            wait_sec = 2 ** (attempt + 1)          # 2 → 4 → 8 сек
+            logging.warning(
+                f"[OpenRouter] Попытка {attempt + 1}/{max_attempts} не удалась: {exc}. "
+                + (f"Повтор через {wait_sec}с..." if attempt < max_attempts - 1 else "Попытки исчерпаны.")
+            )
+            if attempt < max_attempts - 1:
+                time.sleep(wait_sec)
+
+    _log_llm_error(str(last_exc))
+    raise last_exc
+
+
+def _log_llm_error(message: str) -> None:
+    """
+    Пишет ошибку LLM в отдельный лог-файл (logs/llm_errors.log).
+    ab_test_view читает этот файл чтобы показать уведомление пользователю.
+    """
+    try:
+        log_path = BASE_DIR / "logs" / "llm_errors.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(f"{ts} | {message}\n")
+    except Exception:
+        pass  # не даём ошибке логирования сломать основной поток
+
 
 # ==========================================
 # АГЕНТ 1: ОЦИФРОВКА НАКЛАДНЫХ (VISION)
@@ -352,32 +387,22 @@ def run_batch_forecast():
             note_map: dict = {}   # {item_name: note_text}
             llm_used = False
 
-            for attempt in range(retry_count):
-                try:
-                    raw_text = call_openrouter(payload)
-                    llm_notes = json.loads(
-                        raw_text.replace("```json", "").replace("```", "").strip()
-                    )
-                    if not isinstance(llm_notes, list) or not llm_notes:
-                        raise ValueError('LLM вернул пустой или некорректный список')
-                    if 'note' not in llm_notes[0] and 'item_name' not in llm_notes[0]:
-                        raise ValueError('LLM не вернул поле note')
-                    note_map = {r.get('item_name', ''): r.get('note', '') for r in llm_notes}
-                    llm_used = True
-                    break
+            try:
+                raw_text  = call_openrouter(payload, max_attempts=retry_count)
+                llm_notes = json.loads(
+                    raw_text.replace("```json", "").replace("```", "").strip()
+                )
+                if not isinstance(llm_notes, list) or not llm_notes:
+                    raise ValueError('LLM вернул пустой или некорректный список')
+                if 'note' not in llm_notes[0] and 'item_name' not in llm_notes[0]:
+                    raise ValueError('LLM не вернул поле note')
+                note_map = {r.get('item_name', ''): r.get('note', '') for r in llm_notes}
+                llm_used = True
 
-                except Exception as e:
-                    wait_sec = 2 ** (attempt + 1)
-                    logging.warning(
-                        f"[AI] Попытка {attempt + 1}/{retry_count} не удалась: {e}. "
-                        f"Повтор через {wait_sec}с..."
-                    )
-                    if attempt < retry_count - 1:
-                        time.sleep(wait_sec)
-
-            if not llm_used:
+            except Exception as llm_exc:
+                _log_llm_error(f"[run_batch_forecast] {llm_exc}")
                 logging.warning(
-                    f"[AI] LLM недоступен после {retry_count} попыток. "
+                    f"[AI] LLM недоступен: {llm_exc}. "
                     f"Диагноз будет без note для {len(items_data)} товаров."
                 )
 
