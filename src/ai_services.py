@@ -96,6 +96,133 @@ def _log_llm_error(message: str) -> None:
         pass  # не даём ошибке логирования сломать основной поток
 
 
+# ============================================================
+# ЧИСТЫЕ РАСЧЁТНЫЕ ФУНКЦИИ (тестируемые без БД и LLM)
+# ============================================================
+
+def calc_avg_sales(quantities: list) -> tuple:
+    """
+    Вычисляет средний дневной расход через дельты остатков.
+
+    Логика:
+      - Если остаток уменьшился → продажи (берём абс. значение)
+      - Если увеличился → поставка (игнорируем)
+      - Делим на все дни наблюдения (включая нулевые) — не только на дни с продажами
+
+    Возвращает: (avg_sales: float, daily_sales_list: list)
+    """
+    if len(quantities) < 2:
+        return 0.0, []
+
+    daily_sales_list = []
+    for j in range(1, len(quantities)):
+        delta = quantities[j] - quantities[j - 1]
+        if delta < 0:
+            daily_sales_list.append(abs(delta))
+
+    days_tracked = max(1, len(quantities) - 1)
+    if daily_sales_list:
+        avg = round(sum(daily_sales_list) / days_tracked, 2)
+    else:
+        avg = 0.0
+
+    return avg, daily_sales_list
+
+
+def calc_recommended_qty(
+    avg_sales: float,
+    lead_time: int,
+    safety_stock: int,
+    current_qty: int,
+    in_transit: int = 0,
+) -> tuple:
+    """
+    Рассчитывает рекомендуемое количество к заказу по формуле ROP.
+
+    ROP = avg_sales × lead_time + safety_stock
+    recommended = max(0, ROP − (current_qty + in_transit))
+
+    Возвращает: (recommended_qty: int, reorder_point: int)
+    """
+    reorder_point   = int(avg_sales * lead_time) + safety_stock
+    effective_stock = current_qty + in_transit
+    recommended_qty = max(0, reorder_point - effective_stock)
+    return recommended_qty, reorder_point
+
+
+def compute_abc(items: list) -> dict:
+    """
+    ABC-анализ по обороту (revenue = price × volume_sold).
+
+    items: список dict с ключами 'item_name', 'revenue'
+    Если revenue у всех = 0, использует 'volume' как прокси.
+
+    Возвращает: {item_name: 'A' | 'B' | 'C'}
+    """
+    if not items:
+        return {}
+
+    total = sum(i.get("revenue", 0) for i in items)
+    if total == 0:
+        # фоллбек: используем volume
+        total = sum(i.get("volume", 0) for i in items)
+        key = "volume"
+    else:
+        key = "revenue"
+
+    if total == 0:
+        return {i["item_name"]: "C" for i in items}
+
+    sorted_items = sorted(items, key=lambda x: x.get(key, 0), reverse=True)
+    cum = 0.0
+    result = {}
+    for item in sorted_items:
+        cum += item.get(key, 0) / total
+        if cum <= 0.80:
+            result[item["item_name"]] = "A"
+        elif cum <= 0.95:
+            result[item["item_name"]] = "B"
+        else:
+            result[item["item_name"]] = "C"
+    return result
+
+
+def build_diagnosis(item: dict, note: str = "") -> str:
+    """
+    Строит детерминированную строку диагноза (urgency | риск | действие | note).
+
+    item обязан содержать: days_to_zero, lead_time, avg_sales,
+                           safety_stock, recommended_qty, stock, in_transit (опц.)
+    """
+    dtoz = item["days_to_zero"]
+    lt   = item["lead_time"]
+    rop  = int(item["avg_sales"] * item["lead_time"]) + item["safety_stock"]
+    eff  = item["stock"] + item.get("in_transit", 0)
+
+    if dtoz < lt:
+        urgency = "🔴 Критично"
+        risk    = (
+            f"Остаток обнулится через {dtoz:.0f} дн., "
+            f"а поставка идёт {lt} дн. — товар закончится до прихода."
+        )
+    elif dtoz < lt * 1.5:
+        urgency = "🟡 Внимание"
+        risk    = (
+            f"Хватит на {dtoz:.0f} дн. при сроке поставки {lt} дн. "
+            f"— запас критически мал."
+        )
+    else:
+        urgency = "🟢 Норма"
+        risk    = f"Хватит на {dtoz:.0f} дн. — запаса достаточно для покрытия поставки."
+
+    action = f"Заказать {item['recommended_qty']} шт (ROP {rop} − склад+пути {eff})."
+
+    parts = [urgency, f"Риск: {risk}", f"Действие: {action}"]
+    if note:
+        parts.append(f"💡 {note}")
+    return " | ".join(parts)
+
+
 # ==========================================
 # АГЕНТ 1: ОЦИФРОВКА НАКЛАДНЫХ (VISION)
 # ==========================================
@@ -319,38 +446,6 @@ def run_batch_forecast():
 
             today_date = pd.Timestamp.now().strftime('%Y-%m-%d')
 
-            # ── Вспомогательная функция: детерминированный диагноз ───────────
-            # urgency, risk, action вычисляет Python (не LLM) — предсказуемо и быстро.
-            # LLM добавляет только 'note' — контекст который Python не знает.
-            def _build_diagnosis(item: dict, note: str = '') -> str:
-                dtoz = item['days_to_zero']
-                lt   = item['lead_time']
-                rop  = int(item['avg_sales'] * item['lead_time']) + item['safety_stock']
-                eff  = item['stock'] + item.get('in_transit', 0)
-
-                if dtoz < lt:
-                    urgency = '🔴 Критично'
-                    risk    = (
-                        f"Остаток обнулится через {dtoz:.0f} дн., "
-                        f"а поставка идёт {lt} дн. — товар закончится до прихода."
-                    )
-                elif dtoz < lt * 1.5:
-                    urgency = '🟡 Внимание'
-                    risk    = (
-                        f"Хватит на {dtoz:.0f} дн. при сроке поставки {lt} дн. "
-                        f"— запас критически мал."
-                    )
-                else:
-                    urgency = '🟢 Норма'
-                    risk    = f"Хватит на {dtoz:.0f} дн. — запаса достаточно для покрытия поставки."
-
-                action = f"Заказать {item['recommended_qty']} шт (ROP {rop} − склад+пути {eff})."
-
-                parts = [urgency, f"Риск: {risk}", f"Действие: {action}"]
-                if note:
-                    parts.append(f"💡 {note}")
-                return ' | '.join(parts)
-
             # ── Промпт для LLM: только поле 'note' ───────────────────────────
             # Передаём краткую сводку без избыточных цифр.
             # LLM видит: название, ABC, дней до нуля, в пути — и пишет один
@@ -411,7 +506,7 @@ def run_batch_forecast():
                 {
                     "item_name": item["name"],
                     "sku":       item["sku"],
-                    "reason":    _build_diagnosis(item, note_map.get(item["name"], "")),
+                    "reason":    build_diagnosis(item, note_map.get(item["name"], "")),
                 }
                 for item in items_data
             ]
