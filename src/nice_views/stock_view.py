@@ -530,6 +530,26 @@ def setup_page():
             total_count   = len(df_inv)
             removed_count = total_count - actual_count
 
+            # Денежные метрики: Остаток × Цена
+            _qty   = pd.to_numeric(df_inv.get('Остаток', 0), errors='coerce').fillna(0)
+            _price = pd.to_numeric(df_inv.get('Цена',    0), errors='coerce').fillna(0)
+            _value = _qty * _price
+
+            if 'actual' in df_inv.columns:
+                active_value  = _value[df_inv['actual']].sum()
+                frozen_value  = _value[~df_inv['actual']].sum()
+            else:
+                active_value  = _value.sum()
+                frozen_value  = 0.0
+
+            def _fmt_money(v: float) -> str:
+                """Форматирует рубли: 1 234 567 → '1.2 млн ₽', 45000 → '45 тыс ₽'."""
+                if v >= 1_000_000:
+                    return f'{v / 1_000_000:.1f} млн ₽'
+                if v >= 1_000:
+                    return f'{v / 1_000:.0f} тыс ₽'
+                return f'{v:.0f} ₽'
+
             if parser_now:
                 with ui.card().classes('w-full p-3').style(
                     'background:#1c1917; border:1px solid #a16207;'
@@ -540,17 +560,49 @@ def setup_page():
                     ).classes('text-amber-300 text-sm')
 
             with ui.row().classes('gap-4 flex-wrap'):
-                def _stat(label, value, color):
+                def _stat(label, value, color, subtitle=None):
                     with ui.card().classes('p-4').style(
                         f'background:#171717; border-left:3px solid {color};'
                     ):
                         ui.label(str(value)).classes('text-white text-2xl font-bold')
                         ui.label(label).style('color:#9ca3af; font-size:0.8rem;')
+                        if subtitle:
+                            ui.label(subtitle).style('color:#6b7280; font-size:0.7rem;')
 
-                _stat('Всего позиций',   total_count,                          '#60a5fa')
-                _stat('Активных',        actual_count,                         '#34d399')
+                _stat('Всего позиций',   total_count,                            '#60a5fa')
+                _stat('Активных',        actual_count,                           '#34d399')
                 _stat('Снято с сайта',   '...' if parser_now else removed_count, '#f87171')
-                _stat('Дата обновления', latest_date,                          '#a78bfa')
+                _stat('Дата обновления', latest_date,                            '#a78bfa')
+
+            # ── Денежные метрики склада ───────────────────────────────────
+            if active_value > 0 or frozen_value > 0:
+                with ui.row().classes('gap-4 flex-wrap mt-1'):
+
+                    with ui.card().classes('p-4').style(
+                        'background:#171717; border-left:3px solid #34d399;'
+                    ):
+                        ui.label(_fmt_money(active_value)).classes(
+                            'text-white text-2xl font-bold'
+                        )
+                        ui.label('💰 Стоимость склада').style('color:#9ca3af; font-size:0.8rem;')
+                        ui.label('Активные позиции × Цена').style(
+                            'color:#6b7280; font-size:0.7rem;'
+                        )
+
+                    with ui.card().classes('p-4').style(
+                        'background:#171717; border-left:3px solid #f59e0b;'
+                    ):
+                        ui.label(_fmt_money(frozen_value)).classes(
+                            'text-amber-400 text-2xl font-bold'
+                        ).tooltip(
+                            'Товары сняты с сайта, но числятся в остатках. '
+                            'Это замороженный капитал — требуют проверки на полке.'
+                        )
+                        ui.label('🧊 Заморожено (снятые)').style('color:#9ca3af; font-size:0.8rem;')
+                        ui.label(
+                            f'{removed_count} поз. × Цена'
+                            if not parser_now else '...'
+                        ).style('color:#6b7280; font-size:0.7rem;')
 
             ui.separator().style('background:#2a2a2a;')
 
