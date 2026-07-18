@@ -104,7 +104,29 @@ def _get_parser_stats() -> pd.DataFrame:
 #  Компонент: одна строка результата поиска
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _render_stock_row(row):
+def _highlight(text: str, words: list) -> str:
+    """
+    Оборачивает совпадающие слова в <mark> для подсветки в ui.html().
+    Поиск регистронезависимый, учитывает замену ё→е.
+    """
+    import re
+    result = str(text)
+    for word in words:
+        if not word:
+            continue
+        pattern = re.compile(re.escape(word), re.IGNORECASE)
+        result  = pattern.sub(
+            lambda m: (
+                f'<mark style="background:#fbbf24; color:#111111; '
+                f'border-radius:2px; padding:0 2px; font-weight:600;">'
+                f'{m.group()}</mark>'
+            ),
+            result,
+        )
+    return result
+
+
+def _render_stock_row(row, highlight_words: list | None = None):
     """Интерактивная строка с кнопками 📈 ⚠️ ✅."""
     name       = row['Наименование']
     is_actual  = bool(row.get('actual', True))
@@ -123,12 +145,27 @@ def _render_stock_row(row):
     ):
         with ui.row().classes('w-full items-center gap-3 flex-wrap'):
 
-            ui.label(sku).classes('font-mono text-sm').style(
-                'color:#9ca3af; min-width:100px; flex-shrink:0;'
-            )
-            ui.label(display_name).classes(
-                'flex-1 text-sm text-gray-400' if not is_actual else 'flex-1 text-sm text-white'
-            )
+            if highlight_words:
+                _sku_hl  = _highlight(sku, highlight_words)
+                _name_hl = _highlight(display_name, highlight_words)
+                ui.html(
+                    f'<span class="font-mono text-sm" '
+                    f'style="color:#9ca3af; min-width:100px; flex-shrink:0;">'
+                    f'{_sku_hl}</span>'
+                )
+                _name_cls = 'color:#6b7280' if not is_actual else 'color:#f9fafb'
+                ui.html(
+                    f'<span class="flex-1 text-sm" '
+                    f'style="{_name_cls}; flex:1; overflow-wrap:anywhere;">'
+                    f'{_name_hl}</span>'
+                )
+            else:
+                ui.label(sku).classes('font-mono text-sm').style(
+                    'color:#9ca3af; min-width:100px; flex-shrink:0;'
+                )
+                ui.label(display_name).classes(
+                    'flex-1 text-sm text-gray-400' if not is_actual else 'flex-1 text-sm text-white'
+                )
             ui.label(f'{price:.0f} ₽').style(
                 'color:#60a5fa; min-width:70px; text-align:right; flex-shrink:0;'
             )
@@ -530,26 +567,6 @@ def setup_page():
             total_count   = len(df_inv)
             removed_count = total_count - actual_count
 
-            # Денежные метрики: Остаток × Цена
-            _qty   = pd.to_numeric(df_inv.get('Остаток', 0), errors='coerce').fillna(0)
-            _price = pd.to_numeric(df_inv.get('Цена',    0), errors='coerce').fillna(0)
-            _value = _qty * _price
-
-            if 'actual' in df_inv.columns:
-                active_value  = _value[df_inv['actual']].sum()
-                frozen_value  = _value[~df_inv['actual']].sum()
-            else:
-                active_value  = _value.sum()
-                frozen_value  = 0.0
-
-            def _fmt_money(v: float) -> str:
-                """Форматирует рубли: 1 234 567 → '1.2 млн ₽', 45000 → '45 тыс ₽'."""
-                if v >= 1_000_000:
-                    return f'{v / 1_000_000:.1f} млн ₽'
-                if v >= 1_000:
-                    return f'{v / 1_000:.0f} тыс ₽'
-                return f'{v:.0f} ₽'
-
             if parser_now:
                 with ui.card().classes('w-full p-3').style(
                     'background:#1c1917; border:1px solid #a16207;'
@@ -560,49 +577,17 @@ def setup_page():
                     ).classes('text-amber-300 text-sm')
 
             with ui.row().classes('gap-4 flex-wrap'):
-                def _stat(label, value, color, subtitle=None):
+                def _stat(label, value, color):
                     with ui.card().classes('p-4').style(
                         f'background:#171717; border-left:3px solid {color};'
                     ):
                         ui.label(str(value)).classes('text-white text-2xl font-bold')
                         ui.label(label).style('color:#9ca3af; font-size:0.8rem;')
-                        if subtitle:
-                            ui.label(subtitle).style('color:#6b7280; font-size:0.7rem;')
 
                 _stat('Всего позиций',   total_count,                            '#60a5fa')
                 _stat('Активных',        actual_count,                           '#34d399')
                 _stat('Снято с сайта',   '...' if parser_now else removed_count, '#f87171')
                 _stat('Дата обновления', latest_date,                            '#a78bfa')
-
-            # ── Денежные метрики склада ───────────────────────────────────
-            if active_value > 0 or frozen_value > 0:
-                with ui.row().classes('gap-4 flex-wrap mt-1'):
-
-                    with ui.card().classes('p-4').style(
-                        'background:#171717; border-left:3px solid #34d399;'
-                    ):
-                        ui.label(_fmt_money(active_value)).classes(
-                            'text-white text-2xl font-bold'
-                        )
-                        ui.label('💰 Стоимость склада').style('color:#9ca3af; font-size:0.8rem;')
-                        ui.label('Активные позиции × Цена').style(
-                            'color:#6b7280; font-size:0.7rem;'
-                        )
-
-                    with ui.card().classes('p-4').style(
-                        'background:#171717; border-left:3px solid #f59e0b;'
-                    ):
-                        ui.label(_fmt_money(frozen_value)).classes(
-                            'text-amber-400 text-2xl font-bold'
-                        ).tooltip(
-                            'Товары сняты с сайта, но числятся в остатках. '
-                            'Это замороженный капитал — требуют проверки на полке.'
-                        )
-                        ui.label('🧊 Заморожено (снятые)').style('color:#9ca3af; font-size:0.8rem;')
-                        ui.label(
-                            f'{removed_count} поз. × Цена'
-                            if not parser_now else '...'
-                        ).style('color:#6b7280; font-size:0.7rem;')
 
             ui.separator().style('background:#2a2a2a;')
 
@@ -677,7 +662,7 @@ def setup_page():
 
                 with ui.column().classes('w-full gap-2'):
                     for _, srow in f_df.iterrows():
-                        _render_stock_row(srow)
+                        _render_stock_row(srow, highlight_words=words)
 
             def _on_search(e):
                 search_val[0] = e.value
