@@ -140,9 +140,10 @@ def _render_stock_row(row, highlight_words: list | None = None):
         if not is_actual else name
     )
 
-    with ui.card().classes('w-full p-3').style(
+    card_el = ui.card().classes('w-full p-3').style(
         'background:#1a1a1a; border:1px solid #2a2a2a;'
-    ):
+    )
+    with card_el:
         with ui.row().classes('w-full items-center gap-3 flex-wrap'):
 
             if highlight_words:
@@ -195,6 +196,38 @@ def _render_stock_row(row, highlight_words: list | None = None):
                     ui.separator().style('background:#2a2a2a;')
 
                     fact_input    = ui.number('Реальный остаток (шт.):', value=qty, min=0)
+
+                    # ── Живой расчёт расхождения ──────────────────────────
+                    diff_label = ui.label('').style(
+                        'font-size:0.85rem; min-height:1.2em;'
+                    )
+
+                    def _update_diff(e, _qty=qty, _price=price, _dl=diff_label):
+                        try:
+                            fact = int(e.value or 0)
+                        except (ValueError, TypeError):
+                            _dl.set_text('')
+                            return
+                        diff = fact - _qty
+                        if diff == 0:
+                            _dl.set_text('Совпадает ✓')
+                            _dl.style('color:#34d399; font-size:0.85rem;')
+                        else:
+                            rub = abs(diff) * _price
+                            sign = '+' if diff > 0 else '−'
+                            rub_str = (f'{rub / 1000:.1f} тыс ₽'
+                                       if rub >= 1000 else f'{rub:.0f} ₽')
+                            _dl.set_text(
+                                f'Разница: {sign}{abs(diff)} шт. = {sign}{rub_str}'
+                            )
+                            _dl.style(
+                                'color:#f87171; font-size:0.85rem; font-weight:600;'
+                                if diff < 0 else
+                                'color:#fbbf24; font-size:0.85rem; font-weight:600;'
+                            )
+
+                    fact_input.on_value_change(_update_diff)
+
                     is_planned_cb = ui.checkbox(
                         '⚙️ Плановая проверка (циклическая инвентаризация)', value=True
                     )
@@ -234,8 +267,11 @@ def _render_stock_row(row, highlight_words: list | None = None):
                 ui.button('⚠️', on_click=disc_dialog.open) \
                   .props('flat size=sm color=orange').tooltip('Зафиксировать расхождение')
 
-                # ✅ Успешная сверка
-                def _ok(_r=row):
+                # ✅ Успешная сверка — после клика карточка визуально помечается
+                ok_btn = ui.button('✅', on_click=lambda: None) \
+                  .props('flat size=sm color=positive').tooltip('Остаток сошёлся')
+
+                def _ok(_r=row, _card=card_el, _btn=ok_btn):
                     db.save_anomaly_to_db({
                         'item_name':        _r['Наименование'],
                         'anomaly_type':     'Успешная сверка',
@@ -246,10 +282,15 @@ def _render_stock_row(row, highlight_words: list | None = None):
                         'status':           'Закрыта',
                         'comment':          'Сверено с планшета. Всё ок.',
                     })
-                    ui.notify('✅ Сверка подтверждена! Экономия зафиксирована.', type='positive')
+                    # Визуальная метка — зелёная полоска + приглушение
+                    _card.style(
+                        'background:#0a1f0a; border:1px solid #22c55e; '
+                        'border-left:4px solid #22c55e; opacity:0.75;'
+                    )
+                    _btn.props('disable')
+                    ui.notify('✅ Сверка подтверждена!', type='positive', timeout=2000)
 
-                ui.button('✅', on_click=_ok) \
-                  .props('flat size=sm color=positive').tooltip('Остаток сошёлся')
+                ok_btn.on_click(_ok)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -612,9 +653,9 @@ def setup_page():
                     'sortable': True, 'filter': True,
                     'resizable': True, 'floatingFilter': True,
                 }
-                if col == 'Артикул':          cdef['width'] = 130
-                elif col == 'Наименование':   cdef['flex']  = 3
-                elif col in ('Цена', 'Остаток'): cdef['width'] = 100
+                if col == 'Артикул':             cdef['width']    = 130
+                elif col == 'Наименование':      cdef['minWidth'] = 300
+                elif col in ('Цена', 'Остаток'): cdef['width']    = 100
                 col_defs.append(cdef)
 
             search_val = ['']
@@ -651,13 +692,12 @@ def setup_page():
                         columns=[c for c in exclude_cols if c in f_df.columns]
                     ).to_dict('records')
                     ui.aggrid({
-                        'columnDefs':   col_defs,
-                        'rowData':      sub_rows,
-                        'pagination':   True,
+                        'columnDefs':    col_defs,
+                        'rowData':       sub_rows,
+                        'pagination':    True,
                         'paginationPageSize': 50,
-                        'defaultColDef': {'minWidth': 80, 'flex': 1},
-                        'domLayout':    'autoHeight',
-                    }).classes('w-full ag-theme-balham-dark')
+                        'defaultColDef': {'minWidth': 80, 'resizable': True},
+                    }).classes('w-full ag-theme-balham-dark').style('height:520px; width:100%;')
                     return
 
                 with ui.column().classes('w-full gap-2'):
@@ -668,7 +708,10 @@ def setup_page():
                 search_val[0] = e.value
                 render_search_results.refresh()
 
-            ui.input(placeholder='\U0001f50d Артикул или название...').classes('w-full').on_value_change(_on_search)
+            ui.input(placeholder='\U0001f50d Артикул или название...') \
+                .classes('w-full') \
+                .props('dark standout color=white label-color=white') \
+                .on_value_change(_on_search)
 
             render_search_results()
 
@@ -686,11 +729,10 @@ def setup_page():
                 ).to_dict('records')
 
                 ui.aggrid({
-                    'columnDefs':          col_defs,
-                    'rowData':             rows,
-                    'rowSelection':        'single',
-                    'pagination':          True,
-                    'paginationPageSize':  100,
-                    'defaultColDef':       {'minWidth': 80, 'flex': 1},
-                    'domLayout':           'autoHeight',
-                }).classes('w-full ag-theme-balham-dark')
+                    'columnDefs':    col_defs,
+                    'rowData':       rows,
+                    'rowSelection':  {'mode': 'singleRow'},
+                    'pagination':    True,
+                    'paginationPageSize': 100,
+                    'defaultColDef': {'minWidth': 80, 'resizable': True},
+                }).classes('w-full ag-theme-balham-dark').style('height:600px; width:100%;')

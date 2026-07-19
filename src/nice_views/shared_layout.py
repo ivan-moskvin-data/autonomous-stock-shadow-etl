@@ -59,6 +59,83 @@ DARK_CSS = """
         border-color: #3b82f6;
         box-shadow: 0 0 0 1px #3b82f6;
     }
+
+    /* ── AG Grid dark theme (balham-dark) ──────────────────────────────── */
+    .ag-theme-balham-dark {
+        --ag-background-color: #1a1a1a;
+        --ag-foreground-color: #f4f4f5;
+        --ag-border-color: #2a2a2a;
+        --ag-secondary-border-color: #2a2a2a;
+        --ag-header-background-color: #141414;
+        --ag-header-foreground-color: #9ca3af;
+        --ag-odd-row-background-color: #1f1f1f;
+        --ag-row-hover-color: #2a2a2a;
+        --ag-selected-row-background-color: #1e3a5f;
+        --ag-input-focus-border-color: #3b82f6;
+        --ag-range-selection-border-color: #3b82f6;
+        --ag-font-size: 13px;
+        --ag-font-family: ui-sans-serif, system-ui, sans-serif;
+        color: #f4f4f5 !important;
+        background-color: #1a1a1a !important;
+    }
+    .ag-theme-balham-dark .ag-root-wrapper,
+    .ag-theme-balham-dark .ag-root,
+    .ag-theme-balham-dark .ag-body-viewport,
+    .ag-theme-balham-dark .ag-center-cols-container,
+    .ag-theme-balham-dark .ag-center-cols-viewport {
+        background-color: #1a1a1a !important;
+        color: #f4f4f5 !important;
+    }
+    .ag-theme-balham-dark .ag-row {
+        background-color: #1a1a1a !important;
+        color: #f4f4f5 !important;
+        border-bottom: 1px solid #2a2a2a !important;
+    }
+    .ag-theme-balham-dark .ag-row-odd {
+        background-color: #1f1f1f !important;
+    }
+    .ag-theme-balham-dark .ag-row:hover {
+        background-color: #252525 !important;
+    }
+    .ag-theme-balham-dark .ag-cell,
+    .ag-theme-balham-dark .ag-cell-value,
+    .ag-theme-balham-dark .ag-group-value {
+        color: #f4f4f5 !important;
+    }
+    .ag-theme-balham-dark .ag-header {
+        background-color: #141414 !important;
+        border-bottom: 1px solid #2a2a2a !important;
+    }
+    .ag-theme-balham-dark .ag-header-cell,
+    .ag-theme-balham-dark .ag-header-cell-text,
+    .ag-theme-balham-dark .ag-header-group-cell {
+        color: #9ca3af !important;
+        background-color: #141414 !important;
+    }
+    .ag-theme-balham-dark .ag-paging-panel {
+        background-color: #141414 !important;
+        color: #9ca3af !important;
+        border-top: 1px solid #2a2a2a !important;
+    }
+    .ag-theme-balham-dark .ag-paging-button,
+    .ag-theme-balham-dark .ag-paging-description {
+        color: #9ca3af !important;
+    }
+    .ag-theme-balham-dark .ag-floating-filter,
+    .ag-theme-balham-dark .ag-floating-filter-body {
+        background-color: #1a1a1a !important;
+    }
+    .ag-theme-balham-dark .ag-input-field-input,
+    .ag-theme-balham-dark .ag-floating-filter-input input,
+    .ag-theme-balham-dark input[class*="ag-"] {
+        color: #f4f4f5 !important;
+        background-color: #252525 !important;
+        border: 1px solid #2a2a2a !important;
+    }
+    .ag-theme-balham-dark .ag-overlay-no-rows-wrapper {
+        background-color: #1a1a1a !important;
+        color: #9ca3af !important;
+    }
 """
 
 
