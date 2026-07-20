@@ -189,6 +189,29 @@ def _max_risk() -> float:
         return 0.0
 
 
+def _verified_today() -> dict:
+    """
+    Считает сколько позиций сверено вручную сегодня.
+    Источники: 'Вручную (План)' и 'Вручную (Инцидент)'.
+    Возвращает dict с ключами: count, last_time.
+    """
+    try:
+        with db.get_connection() as conn:
+            row = conn.execute("""
+                SELECT
+                    COUNT(*) AS cnt,
+                    MAX(detected_at) AS last_ts
+                FROM anomaly_log
+                WHERE source LIKE 'Вручную%'
+                  AND DATE(detected_at) = DATE('now', 'localtime')
+            """).fetchone()
+        count = int(row[0]) if row and row[0] else 0
+        last  = str(row[1])[:16] if row and row[1] else None
+        return {'count': count, 'last_time': last}
+    except Exception:
+        return {'count': 0, 'last_time': None}
+
+
 def _iq_data(include_tests: bool) -> pd.DataFrame:
     where = "" if include_tests else "WHERE anomaly_type != 'Тестовая запись'"
     try:
@@ -474,6 +497,7 @@ def setup_page():
         _d_legal      = [None]
         _d_ghost      = [None]
         _d_max_risk   = [0.0]
+        _d_verified   = [None]
 
         # ── Outer container — returned to browser immediately ─────────────────
         with ui.column().classes('w-full p-4 gap-6').style(
@@ -505,7 +529,7 @@ def setup_page():
                 (
                     _d_kpi[0], _d_iq[0], _d_fa[0],
                     _d_hist[0], _d_legal[0], _d_ghost[0],
-                    _d_max_risk[0],
+                    _d_max_risk[0], _d_verified[0],
                 ) = await _aio.gather(
                     ng_run.io_bound(_kpi_data,     include_state[0]),
                     ng_run.io_bound(_iq_data,      include_state[0]),
@@ -514,6 +538,7 @@ def setup_page():
                     ng_run.io_bound(_legal_data),
                     ng_run.io_bound(_ghosting_data),
                     ng_run.io_bound(_max_risk),
+                    ng_run.io_bound(_verified_today),
                 )
             except Exception:
                 logger.exception('efficiency: data load failed')
@@ -591,6 +616,18 @@ def setup_page():
                             f"{kpi['trees']:.5f} 🌳",
                             'ESG — Eco Impact', '#22c55e',
                             f'{kpi["sheets"]:.1f} стр. × {COST_PER_SHEET}₽/лист'
+                        )
+                        # ── Сверено сегодня ──────────────────────────────
+                        _vt = _d_verified[0] if _d_verified[0] is not None else _verified_today()
+                        _vt_hint = (
+                            f'Последняя: {_vt["last_time"]}'
+                            if _vt['last_time'] else 'Ещё не было сегодня'
+                        )
+                        _vt_color = '#34d399' if _vt['count'] > 0 else '#6b7280'
+                        _kpi_card(
+                            f"{_vt['count']} поз.",
+                            '✅ Сверено сегодня', _vt_color,
+                            _vt_hint
                         )
 
                 render_kpi()
