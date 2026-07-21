@@ -658,10 +658,46 @@ def setup_page():
                 elif col in ('Цена', 'Остаток'): cdef['width']    = 100
                 col_defs.append(cdef)
 
-            search_val = ['']
+            search_val   = ['']
+            zero_filter  = [False]   # True = показать только нулевые остатки
+
+            # ── Счётчик нулевых остатков (только активные) ───────────────
+            _qty_col   = pd.to_numeric(df_inv.get('Остаток', 0), errors='coerce').fillna(0)
+            _zero_mask = (_qty_col == 0)
+            if 'actual' in df_inv.columns:
+                _zero_mask = _zero_mask & df_inv['actual']
+            zero_count = int(_zero_mask.sum())
 
             @ui.refreshable
             def render_search_results():
+                # ── Режим: фильтр нулевых остатков ───────────────────────
+                if zero_filter[0]:
+                    f_df  = df_inv[_zero_mask].copy()
+                    count = len(f_df)
+                    ui.label(
+                        f'🔴 Нулевые остатки: {count} поз. (активные)'
+                    ).style('color:#f87171; font-size:0.85rem; font-weight:600;')
+                    if count == 0:
+                        ui.label('Нулевых остатков нет ✅').classes('text-green-400')
+                        return
+                    if count > 50:
+                        sub_rows = f_df.drop(
+                            columns=[c for c in exclude_cols if c in f_df.columns]
+                        ).to_dict('records')
+                        ui.aggrid({
+                            'columnDefs':    col_defs,
+                            'rowData':       sub_rows,
+                            'pagination':    True,
+                            'paginationPageSize': 50,
+                            'defaultColDef': {'minWidth': 80, 'resizable': True},
+                        }).classes('w-full ag-theme-balham-dark').style('height:520px; width:100%;')
+                        return
+                    with ui.column().classes('w-full gap-2'):
+                        for _, srow in f_df.iterrows():
+                            _render_stock_row(srow)
+                    return
+
+                # ── Обычный режим: поиск по тексту ───────────────────────
                 query = search_val[0].strip()
                 if not query:
                     with ui.card().classes('w-full p-4').style(
@@ -706,12 +742,26 @@ def setup_page():
 
             def _on_search(e):
                 search_val[0] = e.value
+                zero_filter[0] = False   # сбросить zero-filter при вводе текста
                 render_search_results.refresh()
 
-            ui.input(placeholder='\U0001f50d Артикул или название...') \
-                .classes('w-full') \
-                .props('dark standout color=white label-color=white') \
-                .on_value_change(_on_search)
+            with ui.row().classes('w-full items-center gap-3 flex-wrap'):
+                ui.input(placeholder='\U0001f50d Артикул или название...') \
+                    .classes('flex-1') \
+                    .props('dark standout color=white label-color=white') \
+                    .on_value_change(_on_search)
+
+                # Кнопка-бейдж: нулевые остатки
+                _zero_active = zero_filter[0]
+                def _toggle_zero(_zf=zero_filter, _rs=render_search_results):
+                    _zf[0] = not _zf[0]
+                    _rs.refresh()
+
+                _zero_label = f'\U0001f534 Нулевые ({zero_count})'
+                _zero_props = 'color=negative' if not _zero_active else 'color=grey outline'
+                ui.button(_zero_label, on_click=_toggle_zero) \
+                    .props(f'{_zero_props} no-caps size=sm') \
+                    .tooltip('Показать только товары с остатком 0 шт.')
 
             render_search_results()
 
