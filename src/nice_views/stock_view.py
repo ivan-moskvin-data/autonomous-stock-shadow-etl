@@ -462,6 +462,9 @@ def _render_data_health(
             'Подтвердите физическое наличие на полке.'
         ).classes('text-amber-300 text-sm mb-3')
 
+        # Множественный выбор: хранит имена выбранных товаров
+        selected_lost: set = set()
+
         @ui.refreshable
         def render_lost():
             shown = lost_items[~lost_items['Наименование'].isin(dismissed_lost)]
@@ -484,22 +487,91 @@ def _render_data_health(
                     ).classes('text-amber-300 text-sm')
                 shown = shown.head(DISPLAY_LIMIT)
 
+            shown_names = shown['Наименование'].tolist()
+
+            # ── Панель массовых действий ──────────────────────────────────
+            with ui.row().classes('w-full items-center gap-3 pb-2 flex-wrap').style(
+                'border-bottom:1px solid #2a2a2a; margin-bottom:4px;'
+            ):
+                sel_count_label = ui.label('').style(
+                    'color:#9ca3af; font-size:0.8rem;'
+                )
+
+                def _refresh_count(_sl=selected_lost, _lbl=sel_count_label, _sn=shown_names):
+                    active = [n for n in _sl if n in _sn]
+                    _lbl.set_text(f'Выбрано: {len(active)} из {len(_sn)}')
+
+                _refresh_count()
+
+                def _select_all(_sl=selected_lost, _sn=shown_names, _rl=render_lost):
+                    if all(n in _sl for n in _sn):
+                        _sl.difference_update(_sn)   # снять всё
+                    else:
+                        _sl.update(_sn)               # выбрать всё
+                    _rl.refresh()
+
+                def _bulk_sold(
+                    _sl=selected_lost, _sn=shown_names,
+                    _dl=dismissed_lost, _rl=render_lost
+                ):
+                    names = [n for n in _sl if n in _sn]
+                    if not names:
+                        ui.notify('Ничего не выбрано', type='warning')
+                        return
+                    _dl.extend(names)
+                    _sl.difference_update(names)
+                    ui.notify(
+                        f'🛒 Отмечено как Продано: {len(names)} шт.',
+                        type='positive'
+                    )
+                    _rl.refresh()
+
+                all_sel = all(n in selected_lost for n in shown_names)
+                ui.button(
+                    '☑ Снять всё' if all_sel else '☐ Выбрать все',
+                    on_click=_select_all
+                ).props('flat no-caps size=sm color=grey')
+
+                ui.button(
+                    '🛒 Продано (все выбранные)',
+                    on_click=_bulk_sold
+                ).props('outline color=positive size=sm no-caps')
+
+            # ── Строки товаров с чекбоксами ───────────────────────────────
             for _, lrow in shown.iterrows():
+                item_name = lrow['Наименование']
+
                 with ui.row().classes('w-full items-center gap-3 py-2 flex-wrap'):
+
+                    # Чекбокс
+                    def _on_cb(e, _n=item_name, _sl=selected_lost, _lbl=sel_count_label, _sn=shown_names):
+                        if e.value:
+                            _sl.add(_n)
+                        else:
+                            _sl.discard(_n)
+                        active = [x for x in _sl if x in _sn]
+                        _lbl.set_text(f'Выбрано: {len(active)} из {len(_sn)}')
+
+                    ui.checkbox(
+                        value=(item_name in selected_lost),
+                        on_change=_on_cb,
+                    ).props('color=positive dense').style('flex-shrink:0;')
+
                     ui.label(f"🏷️ {lrow.get('Артикул', '—')}").classes(
                         'font-mono text-sm text-gray-400'
                     ).style('min-width:100px; flex-shrink:0;')
-                    ui.label(lrow['Наименование']).classes('flex-1 text-sm text-white')
+                    ui.label(item_name).classes('flex-1 text-sm text-white')
                     ui.label(f"Было: {lrow.get('Остаток', 0)} шт.").classes(
                         'text-sm text-amber-300 flex-shrink-0'
                     )
 
-                    def _sold(_r=lrow):
-                        dismissed_lost.append(_r['Наименование'])
+                    def _sold(_r=lrow, _sl=selected_lost, _dl=dismissed_lost, _rl=render_lost):
+                        _dl.append(_r['Наименование'])
+                        _sl.discard(_r['Наименование'])
                         ui.notify(f"🛒 Продан: {_r['Наименование']}", type='info')
-                        render_lost.refresh()
+                        _rl.refresh()
 
-                    def _bug(_r=lrow):
+                    def _bug(_r=lrow, _sl=selected_lost, _dl=dismissed_lost, _rl=render_lost):
                         db.save_anomaly_to_db({
                             'item_name':        _r['Наименование'],
                             'anomaly_type':     'Скрыт с витрины (Баг)',
@@ -510,9 +582,10 @@ def _render_data_health(
                             'status':           'Закрыта',
                             'comment':          'Товар физически на складе, но исчез с сайта (Упущенная выручка)',
                         })
-                        dismissed_lost.append(_r['Наименование'])
+                        _dl.append(_r['Наименование'])
+                        _sl.discard(_r['Наименование'])
                         ui.notify('✅ Инцидент "Упущенная выручка" записан в KPI!', type='positive')
-                        render_lost.refresh()
+                        _rl.refresh()
 
                     with ui.row().classes('gap-2 flex-shrink-0'):
                         ui.button('🛒 Продан', on_click=_sold).props('outline color=positive size=sm')
