@@ -338,9 +338,10 @@ def _render_data_health(
     except Exception:
         dur_text = 'н/д'
 
-    # is_running уже передан снаружи — не вызываем psutil повторно
+    # is_running передан снаружи — используем для начального рендера.
+    # Дальше карточка статуса обновляется через ui.timer автономно.
 
-    # ── Метрики ──────────────────────────────────────────────────────────
+    # ── Метрики (статические) ────────────────────────────────────────────
     with ui.row().classes('gap-4 flex-wrap'):
         with ui.card().classes('p-4').style(
             'background:#171717; border-left:3px solid #60a5fa;'
@@ -355,47 +356,60 @@ def _render_data_health(
             ui.label(dur_text).classes('text-white text-2xl font-bold')
             ui.label('Длительность парсинга').style('color:#9ca3af; font-size:0.8rem;')
 
-        with ui.card().classes('p-4').style(
-            'background:#171717; border-left:3px solid #34d399;'
-        ):
-            if is_running:
-                ui.label('🔄 В процессе…').classes('text-amber-400 font-bold text-xl')
-            else:
-                ui.label('✅ Завершён').classes('text-green-400 font-bold text-xl')
-            ui.label('Статус парсера').style('color:#9ca3af; font-size:0.8rem;')
-            with ui.row().classes('gap-2 mt-1'):
-                ui.button(
-                    '🔄 Обновить',
-                    on_click=lambda: ui.navigate.to('/stock')
-                ).props('flat size=sm').classes('text-gray-400')
+        # ── Карточка статуса — обновляется авто каждые 30 с ─────────────
+        @ui.refreshable
+        def _parser_status_card():
+            running = _is_parser_running()
+            border  = '#f59e0b' if running else '#34d399'
+            with ui.card().classes('p-4').style(
+                f'background:#171717; border-left:3px solid {border};'
+            ):
+                if running:
+                    with ui.row().classes('items-center gap-2'):
+                        ui.spinner(size='sm').props('color=amber')
+                        ui.label('В процессе…').classes('text-amber-400 font-bold text-xl')
+                else:
+                    ui.label('✅ Завершён').classes('text-green-400 font-bold text-xl')
+                ui.label('Статус парсера').style('color:#9ca3af; font-size:0.8rem;')
 
-                def _on_launch_click():
-                    result = _launch_parser()
-                    if result == 'launched':
-                        ui.notify(
-                            '🚀 Парсер запущен! Обновите страницу через минуту.',
-                            type='positive', timeout=5000
-                        )
-                        ui.navigate.to('/stock')
-                    elif result == 'already_running':
-                        ui.notify(
-                            '⚠️ Парсер уже работает.',
-                            type='warning', timeout=3000
-                        )
-                    else:
-                        ui.notify(
-                            f'❌ Ошибка запуска: {result}',
-                            type='negative', timeout=6000
-                        )
+                with ui.row().classes('gap-2 items-center mt-1'):
+                    # Метка вместо кнопки обновления
+                    ui.label('🔁 авто 30 с').style(
+                        'color:#6b7280; font-size:0.72rem;'
+                    )
 
-                ui.button(
-                    '▶ Запустить парсер' if not is_running else '⏳ Уже запущен',
-                    on_click=_on_launch_click,
-                ).props(
-                    f'{"outline" if not is_running else "flat"} '
-                    f'color={"positive" if not is_running else "grey"} '
-                    f'size=sm {"disable" if is_running else ""}'
-                ).tooltip('Принудительно запустить сбор данных с сайта')
+                    def _on_launch_click(_r=running):
+                        result = _launch_parser()
+                        if result == 'launched':
+                            ui.notify(
+                                '🚀 Парсер запущен!',
+                                type='positive', timeout=5000
+                            )
+                            _parser_status_card.refresh()
+                        elif result == 'already_running':
+                            ui.notify(
+                                '⚠️ Парсер уже работает.',
+                                type='warning', timeout=3000
+                            )
+                        else:
+                            ui.notify(
+                                f'❌ Ошибка запуска: {result}',
+                                type='negative', timeout=6000
+                            )
+
+                    ui.button(
+                        '▶ Запустить' if not running else '⏳ Идёт…',
+                        on_click=_on_launch_click,
+                    ).props(
+                        f'{"outline" if not running else "flat"} '
+                        f'color={"positive" if not running else "grey"} '
+                        f'size=sm {"disable" if running else ""}'
+                    ).tooltip('Принудительно запустить сбор данных с сайта')
+
+        _parser_status_card()
+
+    # Таймер автообновления: только карточка статуса, без перезагрузки страницы
+    ui.timer(30.0, _parser_status_card.refresh)
 
     # ── Таблица динамики ─────────────────────────────────────────────────
     ui.label(f'📊 Динамика за последние {len(df_stats)} дн.').classes(
