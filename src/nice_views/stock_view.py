@@ -297,6 +297,44 @@ def _render_stock_row(row, highlight_words: list | None = None):
 #  Компонент: Data Health Monitor
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _last_manual_check() -> dict | None:
+    """
+    Возвращает данные о последней ручной сверке из anomaly_log.
+    Ключи: ago (строка), item (название), type (тип), today (bool).
+    None если записей нет.
+    """
+    try:
+        with db.get_connection() as conn:
+            row = conn.execute("""
+                SELECT detected_at, item_name, anomaly_type
+                FROM anomaly_log
+                WHERE source LIKE 'Вручную%'
+                ORDER BY detected_at DESC
+                LIMIT 1
+            """).fetchone()
+        if not row or not row[0]:
+            return None
+        from datetime import datetime as _dt
+        ts  = _dt.fromisoformat(str(row[0])[:19])
+        now = _dt.now()
+        diff_min = max(0, int((now - ts).total_seconds() / 60))
+        if diff_min < 60:
+            ago = f'{diff_min} мин назад'
+        elif diff_min < 1440:
+            h, m = diff_min // 60, diff_min % 60
+            ago  = f'{h} ч {m} мин назад' if m else f'{h} ч назад'
+        else:
+            ago = f'{diff_min // 1440} дн назад'
+        return {
+            'ago':   ago,
+            'item':  str(row[1])[:40] if row[1] else '—',
+            'type':  str(row[2]) if row[2] else '—',
+            'today': (now.date() == ts.date()),
+        }
+    except Exception:
+        return None
+
+
 def _render_data_health(
     df_inv: pd.DataFrame,
     df_stats: pd.DataFrame,
@@ -406,9 +444,39 @@ def _render_data_health(
                         f'size=sm {"disable" if running else ""}'
                     ).tooltip('Принудительно запустить сбор данных с сайта')
 
+        # ── Карточка последней ручной сверки (в том же refreshable) ────
+        lmc = _last_manual_check()
+        if lmc is not None:
+            border_lmc = '#34d399' if lmc['today'] else '#6b7280'
+            with ui.card().classes('p-4').style(
+                f'background:#171717; border-left:3px solid {border_lmc};'
+            ):
+                ui.label(lmc['ago']).classes('text-white text-2xl font-bold')
+                ui.label('Последняя ручная сверка').style(
+                    'color:#9ca3af; font-size:0.8rem;'
+                )
+                ui.label(lmc['item']).style(
+                    'color:#6b7280; font-size:0.72rem; '
+                    'white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:200px;'
+                )
+                ui.label(lmc['type']).style(
+                    f'color:{border_lmc}; font-size:0.7rem;'
+                )
+        else:
+            with ui.card().classes('p-4').style(
+                'background:#171717; border-left:3px solid #374151;'
+            ):
+                ui.label('Нет данных').classes('text-gray-500 text-xl font-bold')
+                ui.label('Последняя ручная сверка').style(
+                    'color:#9ca3af; font-size:0.8rem;'
+                )
+                ui.label('Используйте ✅ или ⚠️ на вкладке Склад').style(
+                    'color:#6b7280; font-size:0.7rem;'
+                )
+
         _parser_status_card()
 
-    # Таймер автообновления: только карточка статуса, без перезагрузки страницы
+    # Таймер автообновления: статус парсера + последняя сверка (оба в refreshable)
     ui.timer(30.0, _parser_status_card.refresh)
 
     # ── Таблица динамики ─────────────────────────────────────────────────
