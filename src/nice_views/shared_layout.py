@@ -18,6 +18,12 @@ DARK_CSS = """
     }
     .q-drawer .q-drawer__content {
         background-color: #111111 !important;
+        overflow-x: hidden !important;
+        scrollbar-width: none !important;          /* Firefox */
+        -ms-overflow-style: none !important;       /* IE / Edge */
+    }
+    .q-drawer .q-drawer__content::-webkit-scrollbar {
+        display: none !important;                  /* Chrome / Safari */
     }
     /* Секционные заголовки */
     .nav-section {
@@ -58,6 +64,21 @@ DARK_CSS = """
         background-color: #1f1f1f !important;
         border-color: #3b82f6;
         box-shadow: 0 0 0 1px #3b82f6;
+    }
+
+    /* ── KPI Grid: равновысокие карточки ───────────────────────────────── */
+    .kpi-grid {
+        align-items: stretch;
+    }
+    /* NiceGUI оборачивает каждый компонент в div — делаем его flex-колонкой */
+    .kpi-grid > div {
+        display: flex !important;
+        flex-direction: column !important;
+    }
+    /* Карточка внутри ячейки занимает всю высоту ячейки */
+    .kpi-grid > div > .q-card {
+        flex: 1 !important;
+        height: 100% !important;
     }
 
     /* ── AG Grid dark theme (balham-dark) ──────────────────────────────── */

@@ -380,16 +380,16 @@ def _render_data_health(
     # Дальше карточка статуса обновляется через ui.timer автономно.
 
     # ── Метрики (статические) ────────────────────────────────────────────
-    with ui.row().classes('gap-4 flex-wrap'):
+    with ui.element('div').classes('kpi-grid').style('display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:1rem; width:100%;'):
         with ui.card().classes('p-4').style(
-            'background:#171717; border-left:3px solid #60a5fa;'
+            'background:#171717; border-left:3px solid #60a5fa; height:100%; box-sizing:border-box;'
         ):
             ui.label(f"{latest['items_count']} шт.").classes('text-white text-2xl font-bold')
             ui.label('Собрано товаров').style('color:#9ca3af; font-size:0.8rem;')
             ui.label(delta_text).style('color:#34d399; font-size:0.75rem;')
 
         with ui.card().classes('p-4').style(
-            'background:#171717; border-left:3px solid #a78bfa;'
+            'background:#171717; border-left:3px solid #a78bfa; height:100%; box-sizing:border-box;'
         ):
             ui.label(dur_text).classes('text-white text-2xl font-bold')
             ui.label('Длительность парсинга').style('color:#9ca3af; font-size:0.8rem;')
@@ -400,7 +400,7 @@ def _render_data_health(
             running = _is_parser_running()
             border  = '#f59e0b' if running else '#34d399'
             with ui.card().classes('p-4').style(
-                f'background:#171717; border-left:3px solid {border};'
+                f'background:#171717; border-left:3px solid {border}; height:100%; box-sizing:border-box;'
             ):
                 if running:
                     with ui.row().classes('items-center gap-2'):
@@ -449,7 +449,7 @@ def _render_data_health(
         if lmc is not None:
             border_lmc = '#34d399' if lmc['today'] else '#6b7280'
             with ui.card().classes('p-4').style(
-                f'background:#171717; border-left:3px solid {border_lmc};'
+                f'background:#171717; border-left:3px solid {border_lmc}; height:100%; box-sizing:border-box;'
             ):
                 ui.label(lmc['ago']).classes('text-white text-2xl font-bold')
                 ui.label('Последняя ручная сверка').style(
@@ -464,7 +464,7 @@ def _render_data_health(
                 )
         else:
             with ui.card().classes('p-4').style(
-                'background:#171717; border-left:3px solid #374151;'
+                'background:#171717; border-left:3px solid #374151; height:100%; box-sizing:border-box;'
             ):
                 ui.label('Нет данных').classes('text-gray-500 text-xl font-bold')
                 ui.label('Последняя ручная сверка').style(
@@ -772,10 +772,10 @@ def setup_page():
                         'Список исчезнувших товаров будет доступен после завершения сбора.'
                     ).classes('text-amber-300 text-sm')
 
-            with ui.row().classes('gap-4 flex-wrap'):
+            with ui.element('div').classes('kpi-grid').style('display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:1rem; width:100%;'):
                 def _stat(label, value, color):
                     with ui.card().classes('p-4').style(
-                        f'background:#171717; border-left:3px solid {color};'
+                        f'background:#171717; border-left:3px solid {color}; height:100%; box-sizing:border-box;'
                     ):
                         ui.label(str(value)).classes('text-white text-2xl font-bold')
                         ui.label(label).style('color:#9ca3af; font-size:0.8rem;')
