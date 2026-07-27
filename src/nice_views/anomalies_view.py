@@ -71,6 +71,8 @@ def setup_page():
         logger.info('anomalies_page() handler entered')
 
         dismissed: list[str] = []
+        filter_state = ['all']   # 'all' | 'up' | 'down'
+        sort_abs     = [False]   # True = сортировать по |Δ| убыванию
 
         # ── Шапка + сайдбар (общая тёмная разметка) ──────────────────────────
         build_shell('/anomalies')
@@ -84,6 +86,7 @@ def setup_page():
                 _render_content(
                     expected_df, df_anomalies, df_inv,
                     dismissed, render_anomalies,
+                    filter_state, sort_abs,
                 )
                 logger.info('render_anomalies() completed OK')
             except Exception as e:
@@ -126,7 +129,11 @@ def _render_content(
     df_inv: pd.DataFrame,
     dismissed: list,
     refresh_fn,
+    filter_state: list | None = None,
+    sort_abs: list | None = None,
 ):
+    if filter_state is None: filter_state = ['all']
+    if sort_abs     is None: sort_abs     = [False]
     active_anom = (
         df_anomalies[~df_anomalies['Наименование'].isin(dismissed)]
         if not df_anomalies.empty else pd.DataFrame()
@@ -176,6 +183,77 @@ def _render_content(
         df_anomalies[~df_anomalies['Наименование'].isin(dismissed)]
         if not df_anomalies.empty else pd.DataFrame()
     )
+
+    # 4a. Фильтры и сортировка ─────────────────────────────────────────
+    cnt_all = len(active_anom)
+
+    # Вычисляем тег каждой строки один раз (для счётчиков и фильтрации)
+    if cnt_all > 0:
+        _tags = active_anom.apply(lambda r: _get_status_tag(r)[0], axis=1)
+        cnt_up      = int((active_anom['Дельта'] > 0).sum())
+        cnt_new     = int((_tags == '✨ НОВИНКА').sum())
+        cnt_ret     = int((_tags == '🔄 ВОЗВРАТ').sum())
+        cnt_restock = int((_tags == '📦 ДОВОЗ').sum())
+        cnt_change  = int(_tags.str.startswith('📝').sum())
+
+        with ui.row().classes('w-full items-center gap-2 flex-wrap mb-2').style(
+            'background:#111; border:1px solid #2a2a2a; border-radius:8px; padding:8px 12px;'
+        ):
+            ui.label('Фильтр:').style('color:#6b7280; font-size:0.8rem; flex-shrink:0;')
+
+            _btn_defs = [
+                (f'Все ({cnt_all})',          'all'),
+                (f'↑ Рост ({cnt_up})',         'up'),
+                (f'✨ Новинки ({cnt_new})',     'new'),
+                (f'🔄 Возвраты ({cnt_ret})',    'return'),
+                (f'📦 Довоз ({cnt_restock})',   'restock'),
+                (f'📝 Изменения ({cnt_change})','change'),
+            ]
+            for _lbl, _val in _btn_defs:
+                _active = filter_state[0] == _val
+                def _set_f(_v=_val, _fs=filter_state, _rf=refresh_fn):
+                    _fs[0] = _v
+                    _rf.refresh()
+                ui.button(_lbl, on_click=_set_f).props(
+                    f'{"unelevated" if _active else "outline"} '
+                    f'color={"primary" if _active else "grey"} '
+                    f'no-caps size=sm dense'
+                )
+
+            ui.element('div').style('flex:1;')  # spacer
+
+            _sorted = sort_abs[0]
+            def _toggle_sort(_sa=sort_abs, _rf=refresh_fn):
+                _sa[0] = not _sa[0]
+                _rf.refresh()
+            ui.button(
+                '🔽 По Δ' if _sorted else 'По Δ',
+                on_click=_toggle_sort,
+            ).props(
+                f'{"unelevated color=primary" if _sorted else "outline color=grey"} '
+                f'no-caps size=sm dense'
+            ).tooltip('Сначала самые крупные поступления')
+
+    # Применяем фильтр
+    if not active_anom.empty:
+        if filter_state[0] == 'up':
+            active_anom = active_anom[active_anom['Дельта'] > 0].copy()
+        elif filter_state[0] == 'new':
+            _tags2 = active_anom.apply(lambda r: _get_status_tag(r)[0], axis=1)
+            active_anom = active_anom[_tags2 == '✨ НОВИНКА'].copy()
+        elif filter_state[0] == 'return':
+            _tags2 = active_anom.apply(lambda r: _get_status_tag(r)[0], axis=1)
+            active_anom = active_anom[_tags2 == '🔄 ВОЗВРАТ'].copy()
+        elif filter_state[0] == 'restock':
+            _tags2 = active_anom.apply(lambda r: _get_status_tag(r)[0], axis=1)
+            active_anom = active_anom[_tags2 == '📦 ДОВОЗ'].copy()
+        elif filter_state[0] == 'change':
+            _tags2 = active_anom.apply(lambda r: _get_status_tag(r)[0], axis=1)
+            active_anom = active_anom[_tags2.str.startswith('📝')].copy()
+
+    # Применяем сортировку по Δ убыванию
+    if sort_abs[0] and not active_anom.empty:
+        active_anom = active_anom.sort_values('Дельта', ascending=False).copy()
 
     # 4. Нет аномалий — успех
     if active_anom.empty:
