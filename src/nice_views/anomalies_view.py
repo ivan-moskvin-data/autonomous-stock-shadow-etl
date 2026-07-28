@@ -308,16 +308,50 @@ def _render_content(
             'Пометить все видимые аномалии как Плановый приход'
         )
 
+    # 6. Предзагрузка данных для карточек (1 запрос вместо N)
+    # price_dict: Наименование -> Цена
+    price_dict: dict = {}
+    if not df_inv.empty and 'Цена' in df_inv.columns:
+        price_dict = df_inv.dropna(subset=['Наименование']).set_index('Наименование')['Цена'].to_dict()
+
+    # hist_dict: Наименование -> (detected_at, anomaly_type, status)
+    # последняя ЗАКРЫТАЯ запись из anomaly_log по каждому товару
+    hist_dict: dict = {}
+    item_names_cur = page_anom['Наименование'].tolist()
+    if item_names_cur:
+        _ph = ','.join(['?'] * len(item_names_cur))
+        try:
+            with db.get_connection() as _hconn:
+                _hrows = _hconn.execute(
+                    f"""
+                    SELECT item_name, detected_at, anomaly_type
+                    FROM anomaly_log
+                    WHERE item_name IN ({_ph})
+                      AND status = 'Закрыта'
+                    ORDER BY detected_at DESC
+                    """,
+                    item_names_cur,
+                ).fetchall()
+            for _hr in _hrows:
+                if _hr[0] not in hist_dict:
+                    hist_dict[_hr[0]] = (_hr[1], _hr[2])  # first = most recent
+        except Exception:
+            pass
+
     # 6. Рисуем карточки
     for idx, row in page_anom.iterrows():
-        _render_card(idx, row, df_inv, df_anomalies, expected_df, dismissed, refresh_fn)
+        _render_card(idx, row, df_inv, df_anomalies, expected_df, dismissed, refresh_fn,
+                     price_dict=price_dict, hist_dict=hist_dict)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Карточка одной аномалии
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _render_card(idx, row, df_inv, df_anomalies, expected_df, dismissed: list, refresh_fn):
+def _render_card(idx, row, df_inv, df_anomalies, expected_df, dismissed: list, refresh_fn,
+                 price_dict: dict | None = None, hist_dict: dict | None = None):
+    if price_dict is None: price_dict = {}
+    if hist_dict  is None: hist_dict  = {}
     status_tag, help_text, color = _get_status_tag(row)
     color_cls = _TAG_COLORS.get(color, 'text-gray-500')
 
@@ -332,8 +366,28 @@ def _render_card(idx, row, df_inv, df_anomalies, expected_df, dismissed: list, r
             with ui.column().classes('flex-1'):
                 ui.label(str(row['Наименование'])).classes('font-semibold text-base').style('color:white;')
                 ui.label(f'{status_tag}  {help_text}').classes(f'text-xs {color_cls}')
+                # ── История: последняя закрытая аномалия по этому товару ────
+                _hist = hist_dict.get(row['Наименование'])
+                if _hist:
+                    try:
+                        from datetime import datetime as _dt
+                        _ts   = _dt.fromisoformat(str(_hist[0])[:19])
+                        _diff = (_dt.now() - _ts).days
+                        _ago  = ('сегодня' if _diff == 0 else
+                                 'вчера'   if _diff == 1 else
+                                 f'{_diff} дн назад')
+                        _atype = str(_hist[1])
+                        ui.label(f'📅 Ранее: {_atype} — {_ago}').style(
+                            'color:#6b7280; font-size:0.7rem; margin-top:2px;'
+                        )
+                    except Exception:
+                        pass
+                else:
+                    ui.label('✨ Первый раз в системе').style(
+                        'color:#374151; font-size:0.7rem; margin-top:2px;'
+                    )
 
-            with ui.row().classes('gap-6 items-center ml-auto'):
+            with ui.row().classes('gap-6 items-center ml-auto flex-wrap'):
                 for lbl, val in [('Было', row['Было']), ('Стало', row['Стало'])]:
                     with ui.column().classes('items-center'):
                         ui.label(lbl).classes('text-xs text-gray-400 uppercase')
@@ -343,6 +397,19 @@ def _render_card(idx, row, df_inv, df_anomalies, expected_df, dismissed: list, r
                     dv  = row['Дельта']
                     cls = 'text-green-600 font-bold' if dv > 0 else 'text-red-600 font-bold'
                     ui.label(f"{'+'if dv>0 else ''}{dv}").classes(f'text-sm {cls}')
+                # ── Финансовый импакт ────────────────────────────────────────
+                with ui.column().classes('items-center'):
+                    ui.label('≈ Сумма').classes('text-xs text-gray-400 uppercase')
+                    try:
+                        _price  = float(price_dict.get(row['Наименование'], 0) or 0)
+                        _impact = abs(int(row['Дельта'])) * _price
+                    except Exception:
+                        _impact = 0
+                    if _impact > 0:
+                        _fmt = f'{_impact:,.0f}'.replace(',', ' ')
+                        ui.label(f'≈ {_fmt} ₽').classes('text-sm text-amber-300 font-bold')
+                    else:
+                        ui.label('—').classes('text-sm text-gray-500')
 
         ui.separator()
 
