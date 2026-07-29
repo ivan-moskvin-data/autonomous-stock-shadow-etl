@@ -71,8 +71,9 @@ def setup_page():
         logger.info('anomalies_page() handler entered')
 
         dismissed: list[str] = []
-        filter_state = ['all']   # 'all' | 'up' | 'down'
-        sort_abs     = [False]   # True = сортировать по |Δ| убыванию
+        filter_state   = ['all']   # 'all' | 'up' | 'down'
+        sort_abs       = [False]   # True = сортировать по |Δ| убыванию
+        selected_names: set = set()  # имена выбранных аномалий
 
         # ── Шапка + сайдбар (общая тёмная разметка) ──────────────────────────
         build_shell('/anomalies')
@@ -87,6 +88,7 @@ def setup_page():
                     expected_df, df_anomalies, df_inv,
                     dismissed, render_anomalies,
                     filter_state, sort_abs,
+                    selected_names,
                 )
                 logger.info('render_anomalies() completed OK')
             except Exception as e:
@@ -131,9 +133,11 @@ def _render_content(
     refresh_fn,
     filter_state: list | None = None,
     sort_abs: list | None = None,
+    selected_names: set | None = None,
 ):
-    if filter_state is None: filter_state = ['all']
-    if sort_abs     is None: sort_abs     = [False]
+    if filter_state   is None: filter_state   = ['all']
+    if sort_abs       is None: sort_abs       = [False]
+    if selected_names is None: selected_names = set()
     active_anom = (
         df_anomalies[~df_anomalies['Наименование'].isin(dismissed)]
         if not df_anomalies.empty else pd.DataFrame()
@@ -338,10 +342,98 @@ def _render_content(
         except Exception:
             pass
 
+    # 6а. Панель массового выбора ─────────────────────────────────────────
+    NO_IMPACT_BULK = {'Системная ошибка', '📦 Плановый приход', '⏳ Догруз с сайта', '🔄 Обновление карточки'}
+    _bulk_options = [
+        '📦 Плановый приход',
+        '⏳ Догруз с сайта',
+        'Системная ошибка',
+        'Утеря',
+        'Тихая отмена',
+        'Излишек',
+        'Пересорт (Склад)',
+        'Пересорт (1С)',
+    ]
+    shown_names = page_anom['Наименование'].tolist()
+
+    sel_count_lbl = ui.label('').style('color:#9ca3af; font-size:0.8rem;')
+    bulk_action   = ui.select(
+        options=_bulk_options,
+        value=_bulk_options[0],
+        label='Действие для выбранных',
+    ).props('dense outlined dark').style('min-width:220px; background:#1a1a1a;')
+
+    def _refresh_sel_label(_sl=selected_names, _sn=shown_names, _lbl=sel_count_lbl):
+        active = [n for n in _sl if n in _sn]
+        _lbl.set_text(f'Выбрано: {len(active)} из {len(_sn)}')
+
+    _refresh_sel_label()
+
+    def _toggle_all(_sl=selected_names, _sn=shown_names, _rf=refresh_fn):
+        if all(n in _sl for n in _sn):
+            _sl.difference_update(_sn)
+        else:
+            _sl.update(_sn)
+        _rf.refresh()
+
+    def _apply_bulk(
+        _sl=selected_names, _sn=shown_names, _dl=dismissed,
+        _rf=refresh_fn, _ba=bulk_action, _pi=price_dict, _da=page_anom
+    ):
+        names = [n for n in _sl if n in _sn]
+        if not names:
+            ui.notify('Ничего не выбрано', type='warning')
+            return
+        label = _ba.value or '📦 Плановый приход'
+        count = 0
+        for n in names:
+            rows = _da[_da['Наименование'] == n]
+            if rows.empty:
+                continue
+            r = rows.iloc[0]
+            try:
+                _price  = float(_pi.get(n, 0) or 0)
+                _impact = 0 if label in NO_IMPACT_BULK else abs(int(r['Дельта'])) * _price
+            except Exception:
+                _impact = 0
+            db.save_anomaly_to_db({
+                'item_name':        n,
+                'anomaly_type':     label,
+                'qty_system':       r['Стало'],
+                'qty_physical':     r['Было'],
+                'financial_impact': _impact,
+                'source':           'Вручную (Массовое)',
+                'status':           'Закрыта' if label in NO_IMPACT_BULK else 'Открыта',
+                'comment':          f'Массовое действие: {label}',
+            })
+            _dl.append(n)
+            count += 1
+        _sl.difference_update(names)
+        ui.notify(f'✅ {count} аномалий → {label}', type='positive')
+        _rf.refresh()
+
+    all_sel = all(n in selected_names for n in shown_names)
+    with ui.row().classes('w-full items-center gap-3 flex-wrap py-2 mb-2').style(
+        'background:#161616; border:1px solid #2a2a2a; border-radius:8px; padding:8px 12px;'
+    ):
+        ui.button(
+            '☑ Снять всё' if all_sel else '☐ Выбрать все',
+            on_click=_toggle_all,
+        ).props('flat no-caps size=sm color=grey dense')
+        sel_count_lbl
+        ui.element('div').style('flex:1;')
+        bulk_action
+        ui.button(
+            '⚡ Применить к выбранным',
+            on_click=_apply_bulk,
+        ).props('outline color=primary no-caps size=sm dense')
+
     # 6. Рисуем карточки
     for idx, row in page_anom.iterrows():
         _render_card(idx, row, df_inv, df_anomalies, expected_df, dismissed, refresh_fn,
-                     price_dict=price_dict, hist_dict=hist_dict)
+                     price_dict=price_dict, hist_dict=hist_dict,
+                     selected_names=selected_names, shown_names=shown_names,
+                     sel_count_lbl=sel_count_lbl)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -349,9 +441,13 @@ def _render_content(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _render_card(idx, row, df_inv, df_anomalies, expected_df, dismissed: list, refresh_fn,
-                 price_dict: dict | None = None, hist_dict: dict | None = None):
-    if price_dict is None: price_dict = {}
-    if hist_dict  is None: hist_dict  = {}
+                 price_dict: dict | None = None, hist_dict: dict | None = None,
+                 selected_names: set | None = None, shown_names: list | None = None,
+                 sel_count_lbl=None):
+    if price_dict     is None: price_dict     = {}
+    if hist_dict      is None: hist_dict      = {}
+    if selected_names is None: selected_names = set()
+    if shown_names    is None: shown_names    = []
     status_tag, help_text, color = _get_status_tag(row)
     color_cls = _TAG_COLORS.get(color, 'text-gray-500')
 
@@ -359,6 +455,21 @@ def _render_card(idx, row, df_inv, df_anomalies, expected_df, dismissed: list, r
 
         # ── Заголовок ─────────────────────────────────────────────────────────
         with ui.row().classes('w-full items-start gap-4 mb-2 flex-wrap'):
+            # Чекбокс массового выбора
+            def _on_cb(e, _n=row['Наименование'], _sl=selected_names,
+                       _sn=shown_names, _lbl=sel_count_lbl):
+                if e.value:
+                    _sl.add(_n)
+                else:
+                    _sl.discard(_n)
+                if _lbl is not None:
+                    active = [x for x in _sl if x in _sn]
+                    _lbl.set_text(f'Выбрано: {len(active)} из {len(_sn)}')
+            ui.checkbox(
+                value=(row['Наименование'] in selected_names),
+                on_change=_on_cb,
+            ).props('color=primary dense').style('flex-shrink:0; margin-top:2px;')
+
             with ui.column().classes('min-w-[80px]'):
                 ui.label('Артикул').classes('text-xs text-gray-400 uppercase')
                 ui.label(str(row.get('Артикул', '—'))).classes('font-mono text-sm font-semibold')
