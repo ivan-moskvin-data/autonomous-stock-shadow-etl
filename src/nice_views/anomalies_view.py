@@ -558,18 +558,22 @@ def _render_card(idx, row, df_inv, df_anomalies, expected_df, dismissed: list, r
                 ui.button('🔗 Принять по накладной (Склеить)', on_click=_fuzzy_link).props('color=primary')
 
         # ── Сетка кнопок 3×3 — цвет и тултип по смысловой группе ─────────────
-        NO_IMPACT = {'Системная ошибка', '📦 Плановый приход', '⏳ Догруз с сайта'}
+        NO_IMPACT     = {'Системная ошибка', '📦 Плановый приход', '⏳ Догруз с сайта'}
+        NEEDS_COMMENT = {'Утеря', 'Тихая отмена', 'Пересорт (Склад)', 'Пересорт (1С)'}
 
         link_panel_ref: dict = {}
 
         def _make_handler(label, r=row, di=df_inv, lpr=link_panel_ref):
             def handler():
+                # ── Открыть панель склейки ───────────────────────────────────
                 if label == '🔄 Обновление карточки':
                     panel = lpr.get('panel')
                     if panel:
                         panel.set_visibility(True)
                     return
-                price = 0
+
+                # ── Вычислить цену заранее (нужна и для диалога и для записи)
+                price = 0.0
                 if not di.empty:
                     vals = di[di['Наименование'] == r['Наименование']]['Цена'].values
                     if len(vals):
@@ -577,6 +581,84 @@ def _render_card(idx, row, df_inv, df_anomalies, expected_df, dismissed: list, r
                             price = float(vals[0])
                         except Exception:
                             pass
+
+                # ── Опасные кнопки: диалог с обязательным комментарием ──────
+                if label in NEEDS_COMMENT:
+                    impact     = abs(r['Дельта'] * price)
+                    impact_fmt = f'{impact:,.0f}'.replace(',', ' ') if impact > 0 else None
+
+                    with ui.dialog() as dlg:
+                        with ui.card().style(
+                            'background:#1a1a1a; border:1px solid #4b5563; '
+                            'min-width:420px; max-width:560px; padding:20px;'
+                        ):
+                            # Заголовок
+                            with ui.row().classes('items-center gap-2 mb-3'):
+                                ui.icon('warning', size='28px').style('color:#ef4444;')
+                                ui.label(f'Подтвердите: {label}').classes(
+                                    'text-white font-bold text-lg'
+                                )
+
+                            # Инфо о товаре
+                            ui.label(str(r['Наименование'])).classes('text-gray-300 text-sm mb-1')
+                            ui.label(
+                                f'Изменение: {r["Было"]} → {r["Стало"]} (Δ = {r["Дельта"]})'
+                            ).classes('text-gray-400 text-xs mb-1')
+                            if impact_fmt:
+                                ui.label(f'Финансовый ущерб: ≈ {impact_fmt} ₽').style(
+                                    'color:#fbbf24; font-size:0.85rem; margin-bottom:12px;'
+                                )
+
+                            ui.separator().style('background:#374151; margin:8px 0;')
+
+                            # Поле комментария
+                            ci = ui.input(
+                                label='Комментарий (обязательно)',
+                                placeholder='Укажите причину или обстоятельства...',
+                            ).classes('w-full').props('outlined dark')
+                            ci.style('--q-color-primary:#3b82f6;')
+
+                            err_lbl = ui.label('').style(
+                                'color:#ef4444; font-size:0.75rem; min-height:16px;'
+                            )
+
+                            def _confirm(
+                                _r=r, _lbl=label, _ci=ci, _d=dlg,
+                                _price=price, _el=err_lbl,
+                            ):
+                                comment = (_ci.value or '').strip()
+                                if not comment:
+                                    _el.set_text('⚠️ Комментарий не может быть пустым')
+                                    return
+                                _el.set_text('')
+                                db.save_anomaly_to_db({
+                                    'item_name':        _r['Наименование'],
+                                    'anomaly_type':     _lbl,
+                                    'qty_system':       _r['Стало'],
+                                    'qty_physical':     _r['Было'],
+                                    'financial_impact': abs(_r['Дельта'] * _price),
+                                    'source':           'Вручную',
+                                    'status':           'Открыта',
+                                    'comment':          comment,
+                                })
+                                if _r['Наименование'] not in dismissed:
+                                    dismissed.append(_r['Наименование'])
+                                _d.close()
+                                ui.notify(f'🔴 Зафиксировано: {_lbl}', type='negative', timeout=3000)
+                                refresh_fn.refresh()
+
+                            with ui.row().classes('gap-2 mt-4 w-full justify-end'):
+                                ui.button('Отмена', on_click=dlg.close).props(
+                                    'flat color=grey no-caps'
+                                )
+                                ui.button('✅ Подтвердить', on_click=_confirm).props(
+                                    'color=negative no-caps'
+                                )
+
+                    dlg.open()
+                    return
+
+                # ── Безопасные кнопки: мгновенная запись ────────────────────
                 auto_comment = ''
                 if label == '📦 Плановый приход':
                     auto_comment = 'Штатное поступление товара'
