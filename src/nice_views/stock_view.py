@@ -3,6 +3,7 @@ stock_view.py — NiceGUI-версия вкладки склада.
 Полный перенос функционала из src/views/stock_view.py.
 """
 from nicegui import ui, run as ng_run
+from starlette.requests import Request
 import sys
 import os
 import subprocess
@@ -685,7 +686,7 @@ def _render_data_health(
 def setup_page():
 
     @ui.page('/stock')
-    async def stock_page():
+    async def stock_page(request: Request):
         logger.info('stock_page() handler entered')
         build_shell('/stock')
 
@@ -813,7 +814,9 @@ def setup_page():
                 elif col in ('Цена', 'Остаток'): cdef['width']    = 100
                 col_defs.append(cdef)
 
-            search_val   = ['']
+            # Читаем ?q= из URL (переход с вкладки Аномалии)
+            _q_param = (request.query_params.get('q', '') or '').strip()
+            search_val   = [_q_param]
             zero_filter  = [False]   # True = показать только нулевые остатки
 
             # ── Счётчик нулевых остатков (только активные) ───────────────
@@ -901,8 +904,10 @@ def setup_page():
                 render_search_results.refresh()
 
             with ui.row().classes('w-full items-center gap-3 flex-wrap'):
-                ui.input(placeholder='\U0001f50d Артикул или название...') \
-                    .classes('flex-1') \
+                ui.input(
+                    placeholder='🔍 Артикул или название...',
+                    value=_q_param,
+                ).classes('flex-1') \
                     .props('dark standout color=white label-color=white') \
                     .on_value_change(_on_search)
 

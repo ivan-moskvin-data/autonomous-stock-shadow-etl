@@ -470,9 +470,21 @@ def _render_card(idx, row, df_inv, df_anomalies, expected_df, dismissed: list, r
                 on_change=_on_cb,
             ).props('color=primary dense').style('flex-shrink:0; margin-top:2px;')
 
+            # Артикул + кнопка быстрого перехода на Склад
             with ui.column().classes('min-w-[80px]'):
                 ui.label('Артикул').classes('text-xs text-gray-400 uppercase')
-                ui.label(str(row.get('Артикул', '—'))).classes('font-mono text-sm font-semibold')
+                _sku  = str(row.get('Артикул', '') or '').strip()
+                _name = str(row.get('Наименование', ''))
+                _q    = _sku if (_sku and _sku != '—') else _name[:40]
+                with ui.row().classes('items-center gap-1'):
+                    ui.label(_sku or '—').classes('font-mono text-sm font-semibold')
+                    ui.button(
+                        icon='search',
+                        on_click=lambda _qv=_q: ui.navigate.to(f'/stock?q={_qv}'),
+                    ).props('flat round dense size=xs color=grey').tooltip(
+                        f'Открыть Склад: поиск «{_q}»'
+                    )
+
 
             with ui.column().classes('flex-1'):
                 ui.label(str(row['Наименование'])).classes('font-semibold text-base').style('color:white;')
