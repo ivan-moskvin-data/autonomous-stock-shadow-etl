@@ -34,19 +34,21 @@ def find_best_invoice_match(anomaly_name: str, expected_df: pd.DataFrame):
 
 
 def _get_status_tag(row):
-    qty_old    = row.get('Было', 0)
-    hist_count = row.get('history_count', 0)
+    qty_old    = row.get('Было', 0) or 0
+    hist_count = row.get('history_count', 0) or 0
     old_alias  = row.get('old_name_alias', None)
     old_sku    = row.get('old_sku_alias', None)
 
-    if qty_old > 0:
-        return '📦 ДОВОЗ',            'Обычное пополнение активного товара.',          'gray'
-    elif pd.notna(old_alias) and old_alias:
+    # FIX 5: алиасы проверяем ПЕРВЫМИ — они специфичнее чем «просто был вчера».
+    # Товар с qty_old > 0 + сменившимся именем — это переименование, не довоз.
+    if pd.notna(old_alias) and str(old_alias).strip():
         return '📝 СМЕНИЛОСЬ ИМЯ',    f'Раньше назывался: {old_alias}.',               'orange'
-    elif pd.notna(old_sku) and old_sku:
+    elif pd.notna(old_sku) and str(old_sku).strip():
         return '📝 СМЕНИЛСЯ АРТИКУЛ', f'Старый артикул: {old_sku}.',                   'orange'
+    elif qty_old > 0:
+        return '📦 ДОВОЗ',            'Обычное пополнение активного товара.',           'gray'
     elif hist_count > 0:
-        return '🔄 ВОЗВРАТ',          'Товар уже был в базе. Жми «Плановый приход».',  'blue'
+        return '🔄 ВОЗВРАТ',          f'Товар был в базе ({hist_count} дн). Жми «Плановый приход».', 'blue'
     else:
         return '✨ НОВИНКА',           'Абсолютно новый товар.',                        'green'
 

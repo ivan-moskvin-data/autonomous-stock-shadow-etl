@@ -1,32 +1,54 @@
 def get_anomalies_query() -> str:
     return """
-        SELECT 
-            sku, 
+        SELECT
+            sku,
             item_name,
             SUM(CASE WHEN SUBSTR(report_timestamp, 1, 10) = :yesterday THEN quantity ELSE 0 END) as qty_old,
-            SUM(CASE WHEN SUBSTR(report_timestamp, 1, 10) = :today THEN quantity ELSE 0 END) as qty_new,
-            (SUM(CASE WHEN SUBSTR(report_timestamp, 1, 10) = :today THEN quantity ELSE 0 END) - 
+            SUM(CASE WHEN SUBSTR(report_timestamp, 1, 10) = :today     THEN quantity ELSE 0 END) as qty_new,
+            (SUM(CASE WHEN SUBSTR(report_timestamp, 1, 10) = :today     THEN quantity ELSE 0 END) -
              SUM(CASE WHEN SUBSTR(report_timestamp, 1, 10) = :yesterday THEN quantity ELSE 0 END)) as delta,
-            
-            -- Проверяем наличие истории ДО вчерашнего дня
-            (SELECT COUNT(*) FROM stocks s_hist 
-             WHERE s_hist.item_name = stocks.item_name 
-             AND SUBSTR(s_hist.report_timestamp, 1, 10) < :yesterday) as history_count,
-             
-            -- Проверяем, встречался ли такой артикул с другим названием (поиск переименования)
-            (SELECT item_name FROM stocks s_sku 
-             WHERE s_sku.sku = stocks.sku 
-             AND s_sku.item_name != stocks.item_name 
-             LIMIT 1) as old_name_alias,
 
-            -- Проверяем, встречалось ли такое имя с другим артикулом
-            (SELECT sku FROM stocks s_name
-             WHERE s_name.item_name = stocks.item_name 
-             AND s_name.sku != stocks.sku AND s_name.sku != ''
-             LIMIT 1) as old_sku_alias
-             
+            -- FIX 1: уникальные дни до вчера (не строки) — точнее отражает «возраст» товара
+            (SELECT COUNT(DISTINCT SUBSTR(s_hist.report_timestamp, 1, 10))
+             FROM stocks s_hist
+             WHERE s_hist.item_name = stocks.item_name
+               AND SUBSTR(s_hist.report_timestamp, 1, 10) < :yesterday) AS history_count,
+
+            -- FIX 2: переименование — тот же SKU, другое имя, ещё не обработанное
+            --   ORDER BY report_timestamp DESC — самое свежее совпадение (не случайное)
+            --   sku != '' — игнорируем пустые артикулы
+            --   NOT EXISTS item_aliases — уже обработали это переименование
+            (SELECT s_sku.item_name
+             FROM stocks s_sku
+             WHERE s_sku.sku        = stocks.sku
+               AND s_sku.sku       != ''
+               AND s_sku.item_name != stocks.item_name
+               AND NOT EXISTS (
+                   SELECT 1 FROM item_aliases ia
+                   WHERE ia.new_name = stocks.item_name
+                     AND ia.old_name = s_sku.item_name
+               )
+             ORDER BY s_sku.report_timestamp DESC
+             LIMIT 1) AS old_name_alias,
+
+            -- FIX 3: смена артикула — то же имя, другой SKU, ещё не обработанное
+            --   ORDER BY report_timestamp DESC — самый свежий старый SKU
+            --   фильтр мусорных SKU: '', '0', '-', 'null', 'н/а', 'нет'
+            (SELECT s_name.sku
+             FROM stocks s_name
+             WHERE s_name.item_name = stocks.item_name
+               AND s_name.sku      != stocks.sku
+               AND LOWER(TRIM(s_name.sku)) NOT IN ('', '0', '-', 'null', 'нет', 'н/а', 'none', 'no')
+               AND NOT EXISTS (
+                   SELECT 1 FROM item_aliases ia
+                   WHERE ia.new_name = stocks.item_name
+               )
+             ORDER BY s_name.report_timestamp DESC
+             LIMIT 1) AS old_sku_alias
+
         FROM stocks
-        WHERE (SUBSTR(report_timestamp, 1, 10) = :today OR SUBSTR(report_timestamp, 1, 10) = :yesterday)
+        WHERE (SUBSTR(report_timestamp, 1, 10) = :today
+               OR SUBSTR(report_timestamp, 1, 10) = :yesterday)
           AND item_name IS NOT NULL
         GROUP BY item_name, sku
         HAVING delta > 0

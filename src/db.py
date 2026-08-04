@@ -55,6 +55,17 @@ def update_anomaly_inbox():
         #    пересоздаём с UNIQUE(item_name) и дедуплицируем данные. ─────────────
         _migrate_inbox_schema(conn)
 
+        # FIX 4: гарантируем существование item_aliases до запроса аномалий
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS item_aliases (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                new_name TEXT NOT NULL,
+                old_name TEXT NOT NULL,
+                UNIQUE (new_name, old_name)
+            )
+        """)
+        conn.commit()
+
         cursor = conn.execute("SELECT DISTINCT SUBSTR(report_timestamp, 1, 10) FROM stocks ORDER BY 1 DESC LIMIT 2")
         dates = [row[0] for row in cursor.fetchall()]
         if len(dates) < 2: return
