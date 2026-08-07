@@ -18,6 +18,8 @@ def get_anomalies_query() -> str:
             --   ORDER BY report_timestamp DESC — самое свежее совпадение (не случайное)
             --   sku != '' — игнорируем пустые артикулы
             --   NOT EXISTS item_aliases — уже обработали это переименование
+            --   NOT EXISTS coexist — оба имени никогда не были в продаже одновременно
+            --     (если были вместе хоть раз → это два разных товара, не переименование)
             (SELECT s_sku.item_name
              FROM stocks s_sku
              WHERE s_sku.sku        = stocks.sku
@@ -28,12 +30,25 @@ def get_anomalies_query() -> str:
                    WHERE ia.new_name = stocks.item_name
                      AND ia.old_name = s_sku.item_name
                )
+               AND NOT EXISTS (
+                   -- Кандидат «старого» имени никогда не появлялся в stocks
+                   -- в тот же день что и «новое» имя → иначе это два разных товара
+                   SELECT 1 FROM stocks c_old
+                   WHERE c_old.item_name = s_sku.item_name
+                     AND EXISTS (
+                         SELECT 1 FROM stocks c_new
+                         WHERE c_new.item_name = stocks.item_name
+                           AND SUBSTR(c_new.report_timestamp, 1, 10)
+                             = SUBSTR(c_old.report_timestamp, 1, 10)
+                     )
+               )
              ORDER BY s_sku.report_timestamp DESC
              LIMIT 1) AS old_name_alias,
 
             -- FIX 3: смена артикула — то же имя, другой SKU, ещё не обработанное
             --   ORDER BY report_timestamp DESC — самый свежий старый SKU
             --   фильтр мусорных SKU: '', '0', '-', 'null', 'н/а', 'нет'
+            --   NOT EXISTS coexist — оба SKU для одного имени никогда не были в один день
             (SELECT s_name.sku
              FROM stocks s_name
              WHERE s_name.item_name = stocks.item_name
@@ -43,8 +58,23 @@ def get_anomalies_query() -> str:
                    SELECT 1 FROM item_aliases ia
                    WHERE ia.new_name = stocks.item_name
                )
+               AND NOT EXISTS (
+                   -- Одно имя с ОБОИМИ артикулами в один день → дублирование данных,
+                   -- а не реальная смена SKU
+                   SELECT 1 FROM stocks c_old
+                   WHERE c_old.item_name = stocks.item_name
+                     AND c_old.sku       = s_name.sku
+                     AND EXISTS (
+                         SELECT 1 FROM stocks c_new
+                         WHERE c_new.item_name = stocks.item_name
+                           AND c_new.sku       = stocks.sku
+                           AND SUBSTR(c_new.report_timestamp, 1, 10)
+                             = SUBSTR(c_old.report_timestamp, 1, 10)
+                     )
+               )
              ORDER BY s_name.report_timestamp DESC
              LIMIT 1) AS old_sku_alias
+
 
         FROM stocks
         WHERE (SUBSTR(report_timestamp, 1, 10) = :today
