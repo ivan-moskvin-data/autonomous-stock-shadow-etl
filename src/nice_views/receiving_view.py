@@ -216,25 +216,110 @@ def setup_page():
                     with result_area:
                         ui.separator().style('background:#2a2a2a;')
                         items = temp_invoice_ref[0]
-                        ui.label(f'✅ Результат: {len(items)} позиций').classes(
-                            'text-green-400 font-semibold'
-                        )
-                        df_r   = pd.DataFrame(items)
-                        cols_r = [
-                            {'field': c, 'headerName': c, 'sortable': True, 'resizable': True, 'flex': 1}
-                            for c in df_r.columns
-                        ]
-                        ui.aggrid({
-                            'columnDefs': cols_r,
-                            'rowData':    df_r.to_dict('records'),
-                            'domLayout':  'autoHeight',
+
+                        # ── Нормализуем типы (qty → int) и считаем предупреждения ──
+                        rows: list[dict] = []
+                        for it in items:
+                            try:
+                                qty = int(it.get('количество', 0) or 0)
+                            except (ValueError, TypeError):
+                                qty = 0
+                            rows.append({
+                                'название':    str(it.get('название',  '') or '').strip(),
+                                'артикул':     str(it.get('артикул',   '') or '').strip(),
+                                'количество':  qty,
+                            })
+
+                        zero_qty = sum(1 for r in rows if r['количество'] == 0)
+                        no_name  = sum(1 for r in rows if not r['название'])
+
+                        # ── Шапка результата ──────────────────────────────────────
+                        with ui.row().classes('w-full items-center justify-between flex-wrap gap-2'):
+                            ui.label(f'✅ Распознано: {len(rows)} позиций').classes(
+                                'text-green-400 font-semibold text-base'
+                            )
+                            if zero_qty:
+                                ui.label(f'⚠️ {zero_qty} строк с нулевым кол-вом').style(
+                                    'color:#fbbf24; font-size:0.82rem;'
+                                )
+                            if no_name:
+                                ui.label(f'🔴 {no_name} строк без названия (пропустятся)').style(
+                                    'color:#ef4444; font-size:0.82rem;'
+                                )
+
+                        ui.label(
+                            '✏️ Нажмите на ячейку чтобы отредактировать. '
+                            'Строки с нулевым количеством подсвечены красным.'
+                        ).style('color:#6b7280; font-size:0.78rem; margin:4px 0 6px;')
+
+                        # ── Редактируемый aggrid ──────────────────────────────────
+                        grid = ui.aggrid({
+                            'columnDefs': [
+                                {
+                                    'field':       'название',
+                                    'headerName':  'Наименование',
+                                    'editable':    True,
+                                    'flex':        1,
+                                    'minWidth':    200,
+                                    'cellEditor':  'agTextCellEditor',
+                                    'cellStyle':   {'color': 'white'},
+                                },
+                                {
+                                    'field':       'артикул',
+                                    'headerName':  'Артикул',
+                                    'editable':    True,
+                                    'width':       150,
+                                    'cellEditor':  'agTextCellEditor',
+                                    'cellStyle':   {
+                                        'color':      '#a5b4fc',
+                                        'fontFamily': 'monospace',
+                                    },
+                                },
+                                {
+                                    'field':       'количество',
+                                    'headerName':  'Кол-во',
+                                    'editable':    True,
+                                    'width':       110,
+                                    'type':        'numericColumn',
+                                    'cellEditor':  'agNumberCellEditor',
+                                    # красный если 0, зелёный если > 0
+                                    'cellStyle':   {
+                                        'function': (
+                                            'params.value == 0 '
+                                            '? {color:"#ef4444", fontWeight:"bold"} '
+                                            ': {color:"#34d399", fontWeight:"bold"}'
+                                        )
+                                    },
+                                },
+                            ],
+                            'rowData':   rows,
+                            'domLayout': 'autoHeight',
+                            'stopEditingWhenCellsLoseFocus': True,
+                            # строка красного фона если qty == 0
+                            'getRowStyle': {
+                                'function': (
+                                    'params.data.количество == 0 '
+                                    '? {background:"#2d1111"} : null'
+                                )
+                            },
                         }).classes('w-full ag-theme-balham-dark')
 
-                        async def save_invoice():
+                        grid_ref: list = [grid]
+
+                        # ── Сохранение: читаем АКТУАЛЬНЫЕ данные из браузера ─────
+                        async def save_invoice(_gr=grid_ref, _tir=temp_invoice_ref):
+                            edited = await _gr[0].get_client_data()
+                            if not edited:
+                                ui.notify('Нет данных для сохранения', type='warning')
+                                return
+
+                            valid   = [r for r in edited if str(r.get('название', '')).strip()]
+                            skipped = len(edited) - len(valid)
+
                             with db.get_connection() as conn:
-                                for item in temp_invoice_ref[0]:
+                                for item in valid:
                                     try:
-                                        qty = int(item.get('количество', 0))
+                                        qty = int(item.get('количество', 0) or 0)
                                     except (ValueError, TypeError):
                                         qty = 0
                                     conn.execute("""
@@ -242,20 +327,35 @@ def setup_page():
                                             (item_name, sku, qty_expected)
                                         VALUES (?, ?, ?)
                                     """, (
-                                        str(item.get('название', '')),
-                                        str(item.get('артикул', '')),
+                                        str(item.get('название', '')).strip(),
+                                        str(item.get('артикул',  '') or '').strip(),
                                         qty,
                                     ))
                                 conn.commit()
-                            temp_invoice_ref[0] = None
+
+                            _tir[0] = None
                             refresh_result()
                             render_expected.refresh()
-                            ui.notify('🎉 Данные добавлены в список ожидания!', type='positive')
 
-                        ui.button(
-                            '💾 Подтвердить и сохранить в Ожидаемые приходы',
-                            on_click=save_invoice,
-                        ).props('color=primary').classes('w-full')
+                            msg = f'🎉 Добавлено {len(valid)} позиций!'
+                            if skipped:
+                                msg += f'  (пропущено {skipped} без названия)'
+                            ui.notify(msg, type='positive')
+
+                        def cancel_result(_tir=temp_invoice_ref):
+                            _tir[0] = None
+                            refresh_result()
+
+                        with ui.row().classes('w-full gap-2 mt-3'):
+                            ui.button(
+                                '💾 Подтвердить и сохранить',
+                                on_click=save_invoice,
+                            ).props('color=primary no-caps').classes('flex-1')
+                            ui.button(
+                                '✕ Отменить',
+                                on_click=cancel_result,
+                            ).props('flat color=negative no-caps')
+
 
             ui.separator().style('background:#2a2a2a;')
 
