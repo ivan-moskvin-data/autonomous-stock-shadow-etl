@@ -360,6 +360,83 @@ def setup_page():
             ui.separator().style('background:#2a2a2a;')
 
             # ══════════════════════════════════════════════════════════════
+            # СЕКЦИЯ 1б: Ручное добавление позиции
+            # ══════════════════════════════════════════════════════════════
+            with ui.expansion(
+                '➕ Добавить позицию вручную',
+                icon='add_circle_outline',
+            ).classes('w-full').style(
+                'background:#111111; border:1px solid #2a2a2a; border-radius:8px;'
+            ):
+                ui.label(
+                    'Если накладная в Excel или нужно добавить пару позиций — '
+                    'заполните форму без фото.'
+                ).style('color:#6b7280; font-size:0.8rem; margin-bottom:10px;')
+
+                with ui.row().classes('w-full items-end gap-2 flex-wrap'):
+                    name_inp = ui.input(
+                        label='Наименование *',
+                        placeholder='Болт М10×50 ГОСТ 7798...',
+                    ).classes('flex-1').props('outlined dark dense')
+                    name_inp.style('min-width:220px;')
+
+                    sku_inp = ui.input(
+                        label='Артикул',
+                        placeholder='ГОСТ 7798',
+                    ).props('outlined dark dense')
+                    sku_inp.style('min-width:120px; max-width:160px;')
+
+                    qty_inp = ui.number(
+                        label='Кол-во',
+                        value=1,
+                        min=1,
+                        precision=0,
+                        format='%d',
+                    ).props('outlined dark dense')
+                    qty_inp.style('min-width:90px; max-width:110px;')
+
+                    def _add_manual(
+                        _ni=name_inp, _si=sku_inp, _qi=qty_inp,
+                    ):
+                        name = (_ni.value or '').strip()
+                        if not name:
+                            ui.notify('⚠️ Введите наименование', type='warning')
+                            return
+                        try:
+                            qty = max(1, int(_qi.value or 1))
+                        except (ValueError, TypeError):
+                            qty = 1
+                        sku = (_si.value or '').strip()
+
+                        with db.get_connection() as conn:
+                            conn.execute(
+                                'INSERT INTO expected_deliveries '
+                                '(item_name, sku, qty_expected) VALUES (?, ?, ?)',
+                                (name, sku, qty),
+                            )
+                            conn.commit()
+
+                        _ni.set_value('')
+                        _si.set_value('')
+                        _qi.set_value(1)
+                        ui.notify(
+                            f'✅ Добавлено: {name} — {qty} шт.',
+                            type='positive',
+                        )
+                        render_expected.refresh()
+
+                    # Enter в любом поле тоже срабатывает
+                    name_inp.on('keydown.enter', _add_manual)
+                    qty_inp.on('keydown.enter', _add_manual)
+
+                    ui.button(
+                        '➕ Добавить',
+                        on_click=_add_manual,
+                    ).props('color=primary no-caps').style('height:40px; flex-shrink:0;')
+
+            ui.separator().style('background:#2a2a2a;')
+
+            # ══════════════════════════════════════════════════════════════
             # СЕКЦИЯ 2: Список ожидаемых товаров
             # ══════════════════════════════════════════════════════════════
             with ui.row().classes('w-full items-center justify-between flex-wrap gap-2'):
@@ -381,6 +458,7 @@ def setup_page():
                 'Эти позиции оцифрованы и ждут появления на сайте '
                 'для авто-легализации аномалий.'
             ).style('color:#9ca3af; font-size:0.85rem; margin-top:-12px;')
+
 
             @ui.refreshable
             def render_expected():
