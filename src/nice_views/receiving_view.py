@@ -443,13 +443,48 @@ def setup_page():
                 ui.label('📋 Список ожидаемых товаров').classes('text-white text-xl font-bold')
 
                 def clear_all():
-                    with db.get_connection() as conn:
-                        conn.execute(
-                            "DELETE FROM expected_deliveries WHERE status = 'Ожидает'"
+                    # Считаем сколько позиций в списке
+                    try:
+                        with db.get_connection() as conn:
+                            n = conn.execute(
+                                "SELECT COUNT(*) FROM expected_deliveries WHERE status = 'Ожидает'"
+                            ).fetchone()[0]
+                    except Exception:
+                        n = 0
+
+                    with ui.dialog() as dlg, ui.card().style(
+                        'background:#1a1a1a; border:1px solid #3f3f3f; min-width:340px;'
+                    ):
+                        ui.label('🗑️ Удалить весь список?').classes(
+                            'text-white text-base font-bold'
                         )
-                        conn.commit()
-                    ui.notify('✅ Список очищен!', type='positive')
-                    render_expected.refresh()
+                        ui.label(
+                            f'Будет удалено {n} позиций. Это действие необратимо.'
+                        ).style('color:#9ca3af; font-size:0.85rem; margin:6px 0 16px;')
+
+                        with ui.row().classes('w-full justify-end gap-2'):
+                            ui.button('Отмена', on_click=dlg.close) \
+                              .props('flat no-caps')
+
+                            def _do_clear(_d=dlg):
+                                with db.get_connection() as conn:
+                                    conn.execute(
+                                        "DELETE FROM expected_deliveries WHERE status = 'Ожидает'"
+                                    )
+                                    conn.commit()
+                                _d.close()
+                                ui.notify(
+                                    f'✅ Список очищен ({n} поз.)',
+                                    type='positive',
+                                )
+                                render_expected.refresh()
+
+                            ui.button(
+                                f'Удалить {n} позиций',
+                                on_click=_do_clear,
+                            ).props('color=negative no-caps')
+
+                    dlg.open()
 
                 ui.button('🗑️ Очистить весь список', on_click=clear_all) \
                   .props('flat color=negative no-caps')
